@@ -9,7 +9,7 @@ A [Herdr](https://herdr.dev) plugin that shows **live token spend** across all y
 - **Live dashboard** — Bubble Tea TUI with Lip Gloss styling, auto-refreshing every 3 seconds
 - **Per-agent breakdown** — cost, tokens (input/output/reasoning/cache), model, provider, session duration, message count, tool call stats
 - **Cost notifications** — Herdr native toast when an agent transitions to `done`, with cost and token summary
-- **Multi-agent support** — tracks [Pi](https://github.com/nicepkg/pi), [OpenCode](https://opencode.ai), and [Claude Code](https://claude.com/claude-code) agent sessions
+- **Multi-agent support** — tracks [Pi](https://github.com/nicepkg/pi), [OpenCode](https://opencode.ai), [Claude Code](https://claude.com/claude-code), and [Codex](https://github.com/openai/codex) agent sessions
 - **Keybinding** — `prefix+$` opens the dashboard instantly
 
 ## Data Sources
@@ -20,6 +20,7 @@ A [Herdr](https://herdr.dev) plugin that shows **live token spend** across all y
 | OpenCode (active) | Server API `http://127.0.0.1:4096/session/{id}` | Live cost, full token breakdown, model, provider, message count, tool calls |
 | OpenCode (completed) | Disk fallback `~/.local/share/opencode/storage/message/{id}/` | Same data from persisted message files |
 | Claude Code | Session transcript `~/.claude/projects/{project}/{session-id}.jsonl` | Full token breakdown (input/output/cache read/cache write), estimated cost, model, message count, tool calls, session duration |
+| Codex | Rollout `~/.codex/sessions/YYYY/MM/DD/rollout-*-{session-id}.jsonl` | Full token breakdown, estimated cost, model, message count, tool calls, session duration |
 
 ### Claude Code
 
@@ -28,6 +29,19 @@ Claude Code panes are matched by their Herdr `agent_session` (source `herdr:clau
 Streamed and retried transcript entries are deduplicated per assistant message, so token counts reflect actual API usage.
 
 > **Note:** Claude Code transcripts don't record cost, so the dashboard computes an **estimate** from a built-in pricing table (per-MTok list rates for current Anthropic models, including cache read/write multipliers). Unknown models show tokens but no cost. Rates live in one table in `main.go` and are easy to update.
+
+### Codex
+
+Codex panes are matched by their Herdr `agent_session` (source `herdr:codex`) and read from the rollout JSONL under `~/.codex/sessions/` (or `$CODEX_HOME/sessions`). The session ID is matched on the rollout filename; if that misses, the `session_meta` line is read instead.
+
+Two Codex-specific details:
+
+- Codex reports **cumulative** totals on every `token_count` event, so the last event wins rather than being summed.
+- Codex's `input_tokens` is **inclusive** of `cached_input_tokens`, unlike the other sources here. The cached portion is subtracted so the IN and CACHE columns mean the same thing for every agent and the totals row stays additive.
+
+Cost is estimated from a second table of OpenAI list rates, scoped to the `gpt-5` family that Codex runs. Those models price cached input at 0.1x input and cache writes at 1.25x — the same multipliers the Anthropic table uses — so both providers share one cost function. Older families are deliberately omitted: `gpt-4.1` caches at 0.25x and `gpt-4o` at 0.5x, so costing them with these multipliers would be wrong, and no rate is better than a wrong one.
+
+> **Note:** long-context rates (roughly double) are not modelled. They apply above a context length larger than the window Codex reports (258,400 for `gpt-5.6-sol`), so a Codex turn cannot reach that tier.
 
 ## Install
 
@@ -82,7 +96,7 @@ Pane w2:p1 · msgs:38 · in:222.5k out:21.7k
 | Column | Description |
 |--------|-------------|
 | PANE | Compact pane ID |
-| AGENT | Agent name (pi / opencode / claude) |
+| AGENT | Agent name (pi / opencode / claude / codex) |
 | STATUS | Current agent status with colored dot |
 | COST | Session cost (green <$5, yellow <$25, red >$25) |
 | MODEL | Current model in use |

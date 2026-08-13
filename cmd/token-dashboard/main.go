@@ -62,6 +62,7 @@ var (
 	piBadge     = lipgloss.NewStyle().Foreground(purple).Bold(true)
 	ocBadge     = lipgloss.NewStyle().Foreground(green).Bold(true)
 	claudeBadge = lipgloss.NewStyle().Foreground(orange).Bold(true)
+	codexBadge  = lipgloss.NewStyle().Foreground(teal).Bold(true)
 
 	// Cost tiers
 	costLow   = lipgloss.NewStyle().Foreground(green)
@@ -336,6 +337,8 @@ func agentBadge(agent string) string {
 		return ocBadge.Render("opencode")
 	case "claude":
 		return claudeBadge.Render("claude")
+	case "codex":
+		return codexBadge.Render("codex")
 	default:
 		return labelStyle.Render(fallback(agent, "—"))
 	}
@@ -907,6 +910,9 @@ func extractStats(p paneEntry) tokenStats {
 	case "herdr:claude", "claude":
 		s.Source = "claude"
 		readClaudeSession(p.AgentSession.Value, p.Cwd, &s)
+	case "herdr:codex", "codex":
+		s.Source = "codex"
+		readCodexSession(p.AgentSession.Value, &s)
 	default:
 		if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
 			s.Source = "pi"
@@ -1029,16 +1035,24 @@ func claudeRates(model string) (in, out float64, ok bool) {
 	return in, out, ok
 }
 
+// blendedCost applies per-MTok input/output rates with the 0.1x cache-read and
+// 1.25x cache-write multipliers. Current Anthropic models and OpenAI's gpt-5
+// family both price cached input at 0.1x and cache writes at 1.25x of input, so
+// both providers share this arithmetic.
+func blendedCost(in, out float64, input, output, cacheRead, cacheWrite int) float64 {
+	return (float64(input)*in +
+		float64(output)*out +
+		float64(cacheRead)*0.1*in +
+		float64(cacheWrite)*1.25*in) / 1_000_000
+}
+
 // claudeCost estimates the USD cost of one assistant turn.
 func claudeCost(model string, input, output, cacheRead, cacheWrite int) float64 {
 	in, out, ok := claudeRates(model)
 	if !ok {
 		return 0
 	}
-	return (float64(input)*in +
-		float64(output)*out +
-		float64(cacheRead)*0.1*in +
-		float64(cacheWrite)*1.25*in) / 1_000_000
+	return blendedCost(in, out, input, output, cacheRead, cacheWrite)
 }
 
 // claudeProjectsRoot returns the Claude Code projects directory
