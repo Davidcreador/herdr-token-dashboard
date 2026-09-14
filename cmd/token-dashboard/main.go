@@ -931,6 +931,7 @@ func readPiSession(path string, s *tokenStats) {
 	}
 
 	var firstTS, lastTS time.Time
+	seenTools := map[string]bool{}
 
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		if len(line) == 0 {
@@ -946,6 +947,21 @@ func readPiSession(path string, s *tokenStats) {
 				PinnedModelKey string  `json:"pinnedModelKey"`
 				Phase          string  `json:"phase"`
 			} `json:"data"`
+			Message struct {
+				Role     string          `json:"role"`
+				Model    string          `json:"model"`
+				Provider string          `json:"provider"`
+				Content  json.RawMessage `json:"content"`
+				Usage    struct {
+					Input      int `json:"input"`
+					Output     int `json:"output"`
+					CacheRead  int `json:"cacheRead"`
+					CacheWrite int `json:"cacheWrite"`
+					Cost       struct {
+						Total float64 `json:"total"`
+					} `json:"cost"`
+				} `json:"usage"`
+			} `json:"message"`
 		}
 		if json.Unmarshal(line, &entry) != nil {
 			continue
@@ -976,7 +992,41 @@ func readPiSession(path string, s *tokenStats) {
 				s.Model = entry.Data.PinnedModelKey
 			}
 		case "message":
-			s.Messages++
+			if entry.Message.Role == "assistant" {
+				s.Messages++
+				if entry.Message.Model != "" {
+					s.Model = entry.Message.Model
+				}
+				if entry.Message.Provider != "" {
+					s.Provider = entry.Message.Provider
+				}
+				s.InputT += entry.Message.Usage.Input
+				s.OutputT += entry.Message.Usage.Output
+				s.CacheR += entry.Message.Usage.CacheRead
+				s.CacheW += entry.Message.Usage.CacheWrite
+				s.Cost += entry.Message.Usage.Cost.Total
+
+				var blocks []struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				}
+				if len(entry.Message.Content) > 0 && json.Unmarshal(entry.Message.Content, &blocks) == nil {
+					for _, blk := range blocks {
+						if blk.Type != "toolCall" || blk.Name == "" {
+							continue
+						}
+						if blk.ID != "" {
+							if seenTools[blk.ID] {
+								continue
+							}
+							seenTools[blk.ID] = true
+						}
+						s.Tools[blk.Name]++
+						s.ToolTotal++
+					}
+				}
+			}
 		case "compaction":
 			s.Compactions++
 		}
