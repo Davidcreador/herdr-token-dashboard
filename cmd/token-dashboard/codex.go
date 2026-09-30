@@ -207,20 +207,22 @@ func readCodexSession(sessionID string, s *tokenStats) {
 // (standard tier, short context). Matching is by substring, longest match
 // first, so "gpt-5.6-sol" wins over "gpt-5".
 //
-// Scoped to the gpt-5 family, which is what Codex runs. Those models price
-// cached input at 0.1x input and cache writes at 1.25x, matching blendedCost.
-// Older families do NOT (gpt-4.1 caches at 0.25x, gpt-4o at 0.5x) and are
-// deliberately omitted rather than costed with the wrong multiplier.
+// Covers the GPT-5 and GPT-6 families used by Codex. Cache writes use 1.25x;
+// cache reads use 0.1x by default, with model exceptions in codexCost. Older
+// families (gpt-4.1 caches at 0.25x, gpt-4o at 0.5x) are omitted rather than
+// costed with the wrong multiplier.
 //
-// Long-context rates (roughly double) are not modelled: they apply above a
-// context length larger than the window Codex reports (258,400 for
-// gpt-5.6-sol), so a Codex turn cannot reach that tier.
+// Long-context rates are not modelled; estimates use short-context rates.
 var openaiPricing = []struct {
 	substr string
 	in     float64 // USD per MTok input
 	out    float64 // USD per MTok output
 }{
-	{"gpt-5.6-sol", 5, 30},
+	{"gpt-6-astra", 5, 25},
+	{"gpt-6.1-sol", 1, 5},
+	{"gpt-6-sol", 1, 5},
+	{"gpt-6-luna", 0.05, 0.25},
+	{"gpt-5.6-sol", 4, 20},
 	{"gpt-5.6-terra", 2, 12},
 	{"gpt-5.6-luna", 0.2, 1.2},
 	{"gpt-5.6-cyber", 12.5, 75},
@@ -261,5 +263,9 @@ func codexCost(model string, input, output, cacheRead, cacheWrite int) float64 {
 	if !ok {
 		return 0
 	}
-	return blendedCost(in, out, input, output, cacheRead, cacheWrite)
+	cacheReadMultiplier := 0.1
+	if strings.Contains(model, "gpt-6.1-sol") {
+		cacheReadMultiplier = 0.05
+	}
+	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite, cacheReadMultiplier)
 }
