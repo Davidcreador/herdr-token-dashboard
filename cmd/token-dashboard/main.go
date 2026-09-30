@@ -1045,18 +1045,22 @@ func readPiSession(path string, s *tokenStats) {
 // USD rates. Prices are ESTIMATES based on public list pricing — update the
 // rates here when Anthropic pricing changes. Matching is by substring,
 // longest match first, so more specific entries (e.g. "sonnet-4-5") win over
-// broader ones ("sonnet-4"). Cache reads are billed at 0.1× the input rate,
-// cache writes at 1.25× the input rate. Unknown models get no cost estimate
-// (tokens are still shown).
+// broader ones ("sonnet-4"). Cache writes are billed at 1.25× input. Cache
+// read rates are 0.1× by default, with exceptions in claudeCacheReadMultiplier.
+// Unknown models get no cost estimate (tokens are still shown).
 var claudePricing = []struct {
 	substr string
 	in     float64 // USD per MTok input
 	out    float64 // USD per MTok output
 }{
-	{"opus-5", 5, 25},
-	{"sonnet-5", 3, 15},
+	{"fable-5-1", 10, 50},
+	{"mythos-5-1", 10, 50},
 	{"fable-5", 10, 50},
 	{"mythos-5", 10, 50},
+	{"opus-5-5", 4, 20},
+	{"sonnet-5-5", 2, 10},
+	{"opus-5", 5, 25},
+	{"sonnet-5", 2, 10},
 	// Opus 4.5 through 4.8 are $5/$25 — they must be listed explicitly, because
 	// the bare "opus-4" entry below substring-matches them and would otherwise
 	// price them at the legacy Opus 4 / 4.1 rate.
@@ -1085,14 +1089,17 @@ func claudeRates(model string) (in, out float64, ok bool) {
 	return in, out, ok
 }
 
-// blendedCost applies per-MTok input/output rates with the 0.1x cache-read and
-// 1.25x cache-write multipliers. Current Anthropic models and OpenAI's gpt-5
-// family both price cached input at 0.1x and cache writes at 1.25x of input, so
-// both providers share this arithmetic.
+// blendedCost applies the default 0.1x cache-read and 1.25x cache-write
+// multipliers. Models with a different published cache-read rate pass it to
+// blendedCostWithCacheRead.
 func blendedCost(in, out float64, input, output, cacheRead, cacheWrite int) float64 {
+	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite, 0.1)
+}
+
+func blendedCostWithCacheRead(in, out float64, input, output, cacheRead, cacheWrite int, cacheReadMultiplier float64) float64 {
 	return (float64(input)*in +
 		float64(output)*out +
-		float64(cacheRead)*0.1*in +
+		float64(cacheRead)*cacheReadMultiplier*in +
 		float64(cacheWrite)*1.25*in) / 1_000_000
 }
 
@@ -1102,7 +1109,18 @@ func claudeCost(model string, input, output, cacheRead, cacheWrite int) float64 
 	if !ok {
 		return 0
 	}
-	return blendedCost(in, out, input, output, cacheRead, cacheWrite)
+	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite, claudeCacheReadMultiplier(model))
+}
+
+// Anthropic's newest models have model-specific cache-hit prices.
+func claudeCacheReadMultiplier(model string) float64 {
+	if strings.Contains(model, "fable-5-1") || strings.Contains(model, "mythos-5-1") {
+		return 0.025
+	}
+	if strings.Contains(model, "opus-5-5") {
+		return 0.05
+	}
+	return 0.1
 }
 
 // claudeProjectsRoot returns the Claude Code projects directory

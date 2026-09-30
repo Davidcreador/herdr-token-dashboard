@@ -39,9 +39,9 @@ Two Codex-specific details:
 - Codex reports **cumulative** totals on every `token_count` event, so the last event wins rather than being summed.
 - Codex's `input_tokens` is **inclusive** of `cached_input_tokens`, unlike the other sources here. The cached portion is subtracted so the IN and CACHE columns mean the same thing for every agent and the totals row stays additive.
 
-Cost is estimated from a second table of OpenAI list rates, scoped to the `gpt-5` family that Codex runs. Those models price cached input at 0.1x input and cache writes at 1.25x — the same multipliers the Anthropic table uses — so both providers share one cost function. Older families are deliberately omitted: `gpt-4.1` caches at 0.25x and `gpt-4o` at 0.5x, so costing them with these multipliers would be wrong, and no rate is better than a wrong one.
+Cost is estimated from a second table of OpenAI list rates for supported Codex models, including the GPT-6 family. Rates use standard tier, short-context prices. Cache reads use the model-specific published multiplier where it differs (GPT-6.1 Sol: 0.05x); cache writes use 1.25x. Older families are deliberately omitted: `gpt-4.1` caches at 0.25x and `gpt-4o` at 0.5x, so costing them with the shared estimate would be wrong, and no rate is better than a wrong one.
 
-> **Note:** long-context rates (roughly double) are not modelled. They apply above a context length larger than the window Codex reports (258,400 for `gpt-5.6-sol`), so a Codex turn cannot reach that tier.
+> **Note:** estimates use short-context rates. Long-context rates can be higher for requests that exceed a model's context threshold.
 
 ## Install
 
