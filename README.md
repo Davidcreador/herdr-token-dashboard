@@ -146,7 +146,7 @@ scripts/capture-dashboard-preview.py /tmp/dashboard.ansi docs/dashboard-preview.
 ```toml
 id = "dave.token-dashboard"
 name = "Token Dashboard"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
 description = "Live token spend dashboard + cost notifications for Herdr agent panes"
 platforms = ["macos", "linux"]
