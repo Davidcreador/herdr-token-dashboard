@@ -68,9 +68,9 @@ func TestReadCodexSession(t *testing.T) {
 	if s.Duration.Seconds() != 30 {
 		t.Errorf("Duration = %v, want 30s", s.Duration)
 	}
-	// gpt-5.6-sol at $5/$30 per MTok, cache read 0.1x in:
-	// (16202*5 + 138*30 + 22016*0.5 + 0) / 1e6
-	want := (16202*5.0 + 138*30.0 + 22016*0.5) / 1e6
+	// gpt-5.6-sol at $4/$20 per MTok, cache read 0.1x in:
+	// (16202*4 + 138*20 + 22016*0.4 + 0) / 1e6
+	want := (16202*4.0 + 138*20.0 + 22016*0.4) / 1e6
 	if s.Cost != want {
 		t.Errorf("Cost = %v, want %v", s.Cost, want)
 	}
@@ -106,7 +106,10 @@ func TestOpenAIRates(t *testing.T) {
 		wantOK bool
 	}{
 		// Longest match must win: every id below also contains "gpt-5".
-		{"gpt-5.6-sol", 5, true},
+		{"gpt-6-astra", 5, true},
+		{"gpt-6.1-sol", 1, true},
+		{"gpt-6-luna", 0.05, true},
+		{"gpt-5.6-sol", 4, true},
 		{"gpt-5.6-luna", 0.2, true},
 		{"gpt-5.3-codex", 1.75, true},
 		{"gpt-5.4-mini", 0.75, true},
@@ -124,6 +127,25 @@ func TestOpenAIRates(t *testing.T) {
 		if ok != tc.wantOK || in != tc.wantIn {
 			t.Errorf("openaiRates(%q) = (in=%v, ok=%v), want (in=%v, ok=%v)",
 				tc.model, in, ok, tc.wantIn, tc.wantOK)
+		}
+	}
+}
+
+func TestCodexCacheReadMultiplier(t *testing.T) {
+	cases := []struct {
+		model string
+		want  float64
+	}{
+		{"gpt-6.1-sol", 0.05},
+		{"gpt-6-astra", 0.1},
+		{"gpt-5.6-sol", 0.1},
+	}
+	for _, tc := range cases {
+		got := codexCost(tc.model, 0, 0, 1_000_000, 0)
+		in, _, _ := openaiRates(tc.model)
+		want := in * tc.want
+		if got != want {
+			t.Errorf("codexCost(%q) for one million cache-read tokens = %v, want %v", tc.model, got, want)
 		}
 	}
 }

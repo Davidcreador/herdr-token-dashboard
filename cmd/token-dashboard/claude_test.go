@@ -215,13 +215,17 @@ func TestClaudeRates(t *testing.T) {
 		wantOK bool
 	}{
 		{"claude-opus-4-8", 5, true},
+		{"claude-opus-5-5", 4, true},
 		{"claude-opus-5", 5, true},
-		{"claude-sonnet-5", 3, true},
+		{"claude-sonnet-5-5", 2, true},
+		{"claude-sonnet-5", 2, true},
 		{"claude-opus-4-1", 15, true},
 		{"claude-sonnet-4-5", 3, true},
 		{"claude-sonnet-4-20250514", 3, true},
 		{"claude-haiku-4-5", 1, true},
 		{"claude-fable-5", 10, true},
+		{"claude-fable-5-1", 10, true},
+		{"claude-mythos-5-1", 10, true},
 		{"some-future-model", 0, false},
 		{"", 0, false},
 	}
@@ -230,6 +234,24 @@ func TestClaudeRates(t *testing.T) {
 		if ok != tc.wantOK || in != tc.wantIn {
 			t.Errorf("claudeRates(%q) = (in=%v, ok=%v), want (in=%v, ok=%v)",
 				tc.model, in, ok, tc.wantIn, tc.wantOK)
+		}
+	}
+}
+
+func TestClaudeCacheReadMultiplier(t *testing.T) {
+	cases := []struct {
+		model string
+		want  float64
+	}{
+		{"claude-fable-5-1", 0.025},
+		{"claude-mythos-5-1", 0.025},
+		{"claude-opus-5-5", 0.05},
+		{"claude-sonnet-5-5", 0.1},
+	}
+	for _, tc := range cases {
+		got := claudeCacheReadMultiplier(tc.model)
+		if got != tc.want {
+			t.Errorf("claudeCacheReadMultiplier(%q) = %v, want %v", tc.model, got, tc.want)
 		}
 	}
 }
