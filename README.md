@@ -117,6 +117,31 @@ Each agent gets a detail card showing:
 - **Compactions** — Pi context compaction count
 - **Tool breakdown** — per-tool call counts (e.g., `bash×112  read×74  edit×26`)
 
+## Theming
+
+The dashboard draws with the terminal's own ANSI palette, so it follows your
+terminal's light and dark themes with no configuration — there is no colour
+table to keep in sync, and no hex value anywhere in the plugin.
+
+Each role uses the normal ANSI half (`1`-`6`) on a light background and the
+bright half (`9`-`14`) on a dark one, so the same style is legible in both. The
+background is detected through the terminal, which Herdr answers for the pane
+using the appearance it read from your terminal when you attached.
+
+| Variable | Values | Effect |
+|---|---|---|
+| `HERDR_TOKEN_DASHBOARD_SCHEME` | `auto` (default), `light`, `dark` | Skips detection and pins an appearance. Useful for a detached Herdr server, which can answer the colour queries with its own stale state. |
+| `NO_COLOR` | any non-empty value | Disables colour entirely ([no-color.org](https://no-color.org)). |
+
+Both are read when the process starts, so reopen the pane after changing them;
+an appearance change mid-session is picked up the next time the dashboard
+starts.
+
+The dashboard deliberately does **not** follow Herdr's own chrome theme
+(`config.toml` `[theme]`). Pane content has never inherited it, and Herdr does
+not yet expose its resolved palette to plugin processes — see
+[herdrdev/herdr discussion #1796](https://github.com/herdrdev/herdr/discussions/1796).
+
 ## Build
 
 ```bash

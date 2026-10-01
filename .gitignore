@@ -2,4 +2,8 @@ bin/
 dist/
 .DS_Store
 *.log
-token-dashboard
+
+# `go build` in the package dir drops a binary named after its directory.
+# Anchored to the file, not the directory: an unanchored `token-dashboard`
+# ignores every source file in cmd/token-dashboard/ too.
+cmd/token-dashboard/token-dashboard

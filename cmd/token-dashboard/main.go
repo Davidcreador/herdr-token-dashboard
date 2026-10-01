@@ -23,27 +23,17 @@ const pluginID = "dave.token-dashboard"
 const opencodeServer = "http://127.0.0.1:4096"
 
 // ── Lip Gloss styles ────────────────────────────────────────────────────────
+//
+// The colours live in theme.go and are ANSI palette roles, not hex values.
 
 var (
-	cyan    = lipgloss.Color("#7dd3fc")
-	green   = lipgloss.Color("#4ade80")
-	yellow  = lipgloss.Color("#facc15")
-	red     = lipgloss.Color("#f87171")
-	purple  = lipgloss.Color("#c084fc")
-	gray    = lipgloss.Color("#6b7280")
-	dimGray = lipgloss.Color("#4b5563")
-	white   = lipgloss.Color("#e5e7eb")
-	blue    = lipgloss.Color("#60a5fa")
-	orange  = lipgloss.Color("#fb923c")
-	teal    = lipgloss.Color("#2dd4bf")
-
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#0f172a")).
+			Foreground(titleFg).
 			Background(cyan).
 			Padding(0, 2)
 	subtitleStyle = lipgloss.NewStyle().
-			Foreground(dimGray).
+			Foreground(dim).
 			Italic(true)
 
 	// Table
@@ -51,46 +41,46 @@ var (
 			Bold(true).
 			Foreground(cyan)
 	separatorStyle = lipgloss.NewStyle().
-			Foreground(dimGray)
+			Foreground(dim)
 	totalSeparatorStyle = lipgloss.NewStyle().
 				Foreground(yellow)
 	totalStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(yellow)
 
-	// Badges
-	piBadge     = lipgloss.NewStyle().Foreground(purple).Bold(true)
+	// Badges. Four hues so the four agents stay distinguishable.
+	piBadge     = lipgloss.NewStyle().Foreground(magenta).Bold(true)
 	ocBadge     = lipgloss.NewStyle().Foreground(green).Bold(true)
-	claudeBadge = lipgloss.NewStyle().Foreground(orange).Bold(true)
-	codexBadge  = lipgloss.NewStyle().Foreground(teal).Bold(true)
+	claudeBadge = lipgloss.NewStyle().Foreground(yellow).Bold(true)
+	codexBadge  = lipgloss.NewStyle().Foreground(blue).Bold(true)
 
 	// Cost tiers
 	costLow   = lipgloss.NewStyle().Foreground(green)
 	costMid   = lipgloss.NewStyle().Foreground(yellow)
 	costHigh  = lipgloss.NewStyle().Foreground(red).Bold(true)
-	costNone  = lipgloss.NewStyle().Foreground(dimGray)
+	costNone  = lipgloss.NewStyle().Foreground(dim)
 	costTotal = lipgloss.NewStyle().Foreground(yellow).Bold(true)
 
 	// Status
 	statusWorking = lipgloss.NewStyle().Foreground(yellow).Bold(true)
 	statusIdle    = lipgloss.NewStyle().Foreground(green)
-	statusDone    = lipgloss.NewStyle().Foreground(dimGray)
+	statusDone    = lipgloss.NewStyle().Foreground(dim)
 	statusBlocked = lipgloss.NewStyle().Foreground(red).Bold(true)
-	statusUnknown = lipgloss.NewStyle().Foreground(dimGray)
+	statusUnknown = lipgloss.NewStyle().Foreground(dim)
 
 	// Card styles
 	cardBorderStyle = lipgloss.NewStyle().
 			BorderLeft(true).
 			BorderStyle(lipgloss.ThickBorder()).
-			BorderForeground(dimGray).
+			BorderForeground(dim).
 			PaddingLeft(1)
 	cardTitleStyle = lipgloss.NewStyle().Bold(true)
-	labelStyle     = lipgloss.NewStyle().Foreground(gray)
-	valueStyle     = lipgloss.NewStyle().Foreground(white).Bold(true)
-	modelStyle     = lipgloss.NewStyle().Foreground(orange)
-	providerStyle  = lipgloss.NewStyle().Foreground(teal)
+	labelStyle     = lipgloss.NewStyle().Foreground(dim)
+	valueStyle     = lipgloss.NewStyle().Foreground(text).Bold(true)
+	modelStyle     = lipgloss.NewStyle().Foreground(cyan)
+	providerStyle  = lipgloss.NewStyle().Foreground(dim)
 	helpStyle      = lipgloss.NewStyle().
-			Foreground(dimGray).
+			Foreground(dim).
 			Italic(true).
 			MarginTop(1)
 	errorStyle = lipgloss.NewStyle().Foreground(red).Bold(true)
