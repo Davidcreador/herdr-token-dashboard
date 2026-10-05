@@ -75,6 +75,9 @@ Or use the keybinding: `prefix+$`
 | Key | Action |
 |-----|--------|
 | `q` / `esc` | Close dashboard |
+| `↑`/`↓`, `j`/`k`, mouse wheel | Scroll |
+| `PgUp`/`PgDn` (`b`/`f`/`space`) | Scroll a page |
+| `g`/`G` (`Home`/`End`) | Jump to top / end |
 | `r` | Manual refresh |
 | Auto | Refreshes every 3 seconds |
 

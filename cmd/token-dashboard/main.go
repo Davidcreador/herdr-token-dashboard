@@ -230,6 +230,9 @@ type model struct {
 	// prevStatus tracks the last known status per pane_id so the poll loop
 	// can detect transitions to "done" and fire a Herdr notification.
 	prevStatus map[string]string
+	// offset is the first body line shown: the body (table + cards) scrolls
+	// under a fixed header and help line.
+	offset int
 }
 
 func initialModel() model {
@@ -252,15 +255,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.refresh()
 		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+	case tea.MouseWheelMsg:
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.offset -= 3
+		case tea.MouseWheelDown:
+			m.offset += 3
+		}
 	case tea.KeyPressMsg:
+		page := m.bodyHeight() - 1
+		if page < 1 {
+			page = 1
+		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
 		case "r":
 			m.refresh()
+		case "up", "k":
+			m.offset--
+		case "down", "j":
+			m.offset++
+		case "pgup", "b", "ctrl+u":
+			m.offset -= page
+		case "pgdown", "f", "space", "ctrl+d":
+			m.offset += page
+		case "home", "g":
+			m.offset = 0
+		case "end", "G":
+			m.offset = 1 << 30 // clamped in View
 		}
 	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
 	return m, nil
+}
+
+// bodyHeight is the number of screen lines available to the scrolling body:
+// the terminal height minus the header (2 lines) and the help line (2 lines).
+func (m model) bodyHeight() int {
+	h := m.height - 4
+	if h < 3 {
+		h = 3
+	}
+	return h
 }
 
 func (m *model) refresh() {
@@ -398,30 +437,65 @@ func trunc(s string, width int) string {
 // ── View ────────────────────────────────────────────────────────────────────
 
 func (m model) View() tea.View {
-	var b strings.Builder
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	// ── Header ────────────────────────────────────────────────────────
+	// ── Header (fixed) ────────────────────────────────────────────────
 	header := titleStyle.Render(" ◆ Token Dashboard ")
 	sub := subtitleStyle.Render(
 		fmt.Sprintf("  auto-refresh 3s  ·  %s", m.updated.Format("15:04:05")),
 	)
-	b.WriteString(header + sub + "\n\n")
 
-	if m.err != "" {
-		b.WriteString(errorStyle.Render("  ⚠ "+m.err) + "\n")
-		b.WriteString(helpStyle.Render("  r refresh  ·  q/esc close") + "\n")
-		view := tea.NewView(b.String())
-		view.AltScreen = true
-		return view
+	// ── Body (scrolls) ────────────────────────────────────────────────
+	b := m.renderBody(width)
+	lines := strings.Split(strings.TrimRight(b, "\n"), "\n")
+	bh := m.bodyHeight()
+	maxOff := len(lines) - bh
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	off := m.offset
+	if off > maxOff {
+		off = maxOff
+	}
+	end := off + bh
+	if end > len(lines) {
+		end = len(lines)
+	}
+	body := strings.Join(lines[off:end], "\n")
+	if pad := bh - (end - off); pad > 0 {
+		body += strings.Repeat("\n", pad)
 	}
 
-	if len(m.stats) == 0 {
+	// ── Help (fixed) ──────────────────────────────────────────────────
+	pos := ""
+	if maxOff > 0 {
+		pos = fmt.Sprintf("  ·  lines %d–%d of %d", off+1, end, len(lines))
+	}
+	help := helpStyle.Render(m.helpText() + pos)
+
+	view := tea.NewView(header + sub + "\n\n" + body + "\n" + help) // helpStyle carries its own MarginTop(1)
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	return view
+}
+
+// helpText is the fixed help line under the scrolling body.
+func (m model) helpText() string {
+	return "  ↑↓/jk scroll  ·  PgUp/PgDn  ·  g/G top/end  ·  r refresh  ·  q/esc close"
+}
+
+// renderBody renders everything below the header; View scrolls it.
+func (m model) renderBody(width int) string {
+	var b strings.Builder
+	switch {
+	case m.err != "":
+		b.WriteString(errorStyle.Render("  ⚠ "+m.err) + "\n")
+	case len(m.stats) == 0:
 		b.WriteString(labelStyle.Render("  No agent panes detected.") + "\n")
-	} else {
+	default:
 		b.WriteString(renderTable(m.stats, m.total, width))
 		b.WriteString("\n")
 		for _, s := range m.stats {
@@ -430,12 +504,7 @@ func (m model) View() tea.View {
 		}
 		b.WriteString(renderSummary(m.total, len(m.stats), width))
 	}
-
-	b.WriteString("\n" + helpStyle.Render("  r refresh  ·  q/esc close  ·  auto-refresh 3s"))
-
-	view := tea.NewView(b.String())
-	view.AltScreen = true
-	return view
+	return b.String()
 }
 
 // renderTable renders the summary table with responsive column widths.
