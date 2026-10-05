@@ -1054,7 +1054,8 @@ func readPiSession(path string, s *tokenStats) {
 // USD rates. Prices are ESTIMATES based on public list pricing — update the
 // rates here when Anthropic pricing changes. Matching is by substring,
 // longest match first, so more specific entries (e.g. "sonnet-4-5") win over
-// broader ones ("sonnet-4"). Cache writes are billed at 1.25× input. Cache
+// broader ones ("sonnet-4"). Cache writes are billed at 1.25× input (2× for
+// the 1-hour TTL, see claudeCostTTL). Cache
 // read rates are 0.1× by default, with exceptions in claudeCacheReadMultiplier.
 // Unknown models get no cost estimate (tokens are still shown).
 var claudePricing = []struct {
@@ -1114,11 +1115,23 @@ func blendedCostWithCacheRead(in, out float64, input, output, cacheRead, cacheWr
 
 // claudeCost estimates the USD cost of one assistant turn.
 func claudeCost(model string, input, output, cacheRead, cacheWrite int) float64 {
+	return claudeCostTTL(model, input, output, cacheRead, cacheWrite, 0)
+}
+
+// claudeCostTTL is claudeCost with the 1-hour-TTL share of the cache writes
+// (usage.cache_creation.ephemeral_1h_input_tokens) priced at 2x input instead
+// of 1.25x, per Anthropic's prompt-caching pricing. Claude Code main sessions
+// typically write with the 1h TTL; subagents with the 5m TTL.
+func claudeCostTTL(model string, input, output, cacheRead, cacheWrite, cacheWrite1h int) float64 {
 	in, out, ok := claudeRates(model)
 	if !ok {
 		return 0
 	}
-	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite, claudeCacheReadMultiplier(model))
+	if cacheWrite1h > cacheWrite {
+		cacheWrite1h = cacheWrite
+	}
+	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite-cacheWrite1h, claudeCacheReadMultiplier(model)) +
+		float64(cacheWrite1h)*2.0*in/1_000_000
 }
 
 // Anthropic's newest models have model-specific cache-hit prices.
@@ -1202,6 +1215,7 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 	type claudeTurn struct {
 		model                         string
 		input, output, cacheR, cacheW int
+		cacheW1h                      int
 		sub                           bool
 	}
 	turns := map[string]claudeTurn{}
@@ -1234,6 +1248,9 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 						OutputTokens             int `json:"output_tokens"`
 						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+						CacheCreation            struct {
+							OneHour int `json:"ephemeral_1h_input_tokens"`
+						} `json:"cache_creation"`
 					} `json:"usage"`
 					Content json.RawMessage `json:"content"`
 				} `json:"message"`
@@ -1261,12 +1278,13 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 			}
 
 			turns[entry.Message.ID+"\x00"+entry.RequestID] = claudeTurn{
-				model:  entry.Message.Model,
-				input:  entry.Message.Usage.InputTokens,
-				output: entry.Message.Usage.OutputTokens,
-				cacheR: entry.Message.Usage.CacheReadInputTokens,
-				cacheW: entry.Message.Usage.CacheCreationInputTokens,
-				sub:    isSub,
+				model:    entry.Message.Model,
+				input:    entry.Message.Usage.InputTokens,
+				output:   entry.Message.Usage.OutputTokens,
+				cacheR:   entry.Message.Usage.CacheReadInputTokens,
+				cacheW:   entry.Message.Usage.CacheCreationInputTokens,
+				sub:      isSub,
+				cacheW1h: entry.Message.Usage.CacheCreation.OneHour,
 			}
 
 			// Tool calls appear as tool_use content blocks. Blocks carry unique
@@ -1302,7 +1320,7 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 		s.OutputT += t.output
 		s.CacheR += t.cacheR
 		s.CacheW += t.cacheW
-		c := claudeCost(t.model, t.input, t.output, t.cacheR, t.cacheW)
+		c := claudeCostTTL(t.model, t.input, t.output, t.cacheR, t.cacheW, t.cacheW1h)
 		s.Cost += c
 		if t.sub {
 			s.SubCost += c

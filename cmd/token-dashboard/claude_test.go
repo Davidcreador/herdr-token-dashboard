@@ -304,3 +304,17 @@ func TestReadClaudeSessionSubagents(t *testing.T) {
 		t.Errorf("Duration = %v, want 0 (subagent timestamps must not stretch the session)", s.Duration)
 	}
 }
+
+func TestClaudeCostTTL(t *testing.T) {
+	// 1M cache-write tokens on Opus 5 ($5/MTok input): 1h TTL = 2x = $10, 5m TTL = 1.25x = $6.25.
+	if got := claudeCostTTL("claude-opus-5", 0, 0, 0, 1_000_000, 1_000_000); math.Abs(got-10) > 1e-9 {
+		t.Errorf("1h write cost = %v, want 10", got)
+	}
+	if got := claudeCostTTL("claude-opus-5", 0, 0, 0, 1_000_000, 0); math.Abs(got-6.25) > 1e-9 {
+		t.Errorf("5m write cost = %v, want 6.25", got)
+	}
+	// A transcript's 1h breakdown can never exceed the total write count.
+	if got := claudeCostTTL("claude-opus-5", 0, 0, 0, 100, 1_000_000); math.Abs(got-claudeCostTTL("claude-opus-5", 0, 0, 0, 100, 100)) > 1e-12 {
+		t.Errorf("1h share not clamped to cacheWrite: %v", got)
+	}
+}
