@@ -105,6 +105,7 @@ type paneEntry struct {
 	Label        string        `json:"label,omitempty"`
 	TabID        string        `json:"tab_id,omitempty"`
 	Cwd          string        `json:"cwd,omitempty"`
+	Title        string        `json:"terminal_title_stripped,omitempty"`
 	AgentSession *agentSession `json:"agent_session,omitempty"`
 }
 
@@ -143,6 +144,7 @@ type tokenStats struct {
 	Compactions int
 	Subagents   int     // Claude Code: subagent transcripts folded into the totals
 	SubCost     float64 // Claude Code: the subagents' share of Cost
+	SessTitle   string  // the pane's terminal title (Claude Code sets it per conversation)
 	Started     time.Time
 	LastAct     time.Time
 	Duration    time.Duration
@@ -383,7 +385,14 @@ func trunc(s string, width int) string {
 	if lipgloss.Width(s) <= width {
 		return s
 	}
-	return s[:width-1] + "…"
+	if width < 1 {
+		return ""
+	}
+	r := []rune(s) // rune-safe: byte slicing split multi-byte characters
+	for len(r) > 0 && lipgloss.Width(string(r))+1 > width {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 // ── View ────────────────────────────────────────────────────────────────────
@@ -435,7 +444,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 
 	// Column widths — responsive to terminal width.
 	avail := width - 4 // 2 indent + 2 padding
-	wPane := 11
+	wPane := 34
 	wAgent := 9
 	wStatus := 9
 	wCost := 9
@@ -443,6 +452,11 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 	wMsg := 6
 	wTools := 6
 	fixedW := wPane + wAgent + wStatus + wCost + wModel + wMsg + wTools + 6 // 6 spaces between
+	if fixedW > avail && wPane-(fixedW-avail) >= 18 {
+		// The SESSION column gives way first, down to 18 cells.
+		wPane -= fixedW - avail
+		fixedW = avail
+	}
 	if fixedW > avail {
 		// Drop model and tools columns if too narrow.
 		wModel = 0
@@ -470,7 +484,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 
 	// Header row
 	hdrParts := []string{
-		padRight("PANE", wPane),
+		padRight("SESSION", wPane),
 		padRight("AGENT", wAgent),
 		padRight("STATUS", wStatus),
 		padRight("COST", wCost),
@@ -505,7 +519,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		}
 
 		rowParts := []string{
-			padRight(paneDisplay(s), wPane),
+			padRight(trunc(paneDisplay(s), wPane), wPane),
 			padRight(agentBadge(s.Agent), wAgent),
 			padRight(statusStr, wStatus),
 			padRight(costS.Render(costStr), wCost),
@@ -559,6 +573,9 @@ func renderCard(s tokenStats, width int) string {
 	statusText := fallback(s.Status, "—")
 
 	headerLine := fmt.Sprintf("%s %s %s", badge, dot, statusText)
+	if label := paneDisplay(s); label != "" {
+		headerLine += "  " + valueStyle.Render(label)
+	}
 	if s.Model != "" {
 		headerLine += "  " + modelStyle.Render(s.Model)
 	}
@@ -872,13 +889,54 @@ func fetchTabLabels() map[string]string {
 	return labels
 }
 
-// paneDisplay is the PANE column value: the tab label when the pane's tab has
-// one, else the short pane id.
+// paneDisplay is the SESSION column value. A tab the user has named keeps its
+// label; Herdr's default tab labels are just numbers ("1", "2", …) and identify
+// nothing, so those panes show the project (from the cwd) and the session's
+// terminal title, which Claude Code sets per conversation.
 func paneDisplay(s tokenStats) string {
-	if s.TabLabel != "" {
+	if s.TabLabel != "" && !isDefaultTabLabel(s.TabLabel) {
+		return s.TabLabel
+	}
+	name := projectName(s.Cwd)
+	switch {
+	case name != "" && s.SessTitle != "":
+		return name + " · " + s.SessTitle
+	case name != "":
+		return name
+	case s.SessTitle != "":
+		return s.SessTitle
+	case s.TabLabel != "":
 		return s.TabLabel
 	}
 	return shortPaneID(s.PaneID)
+}
+
+// isDefaultTabLabel reports whether a tab label is Herdr's numeric default.
+func isDefaultTabLabel(l string) bool {
+	for _, r := range l {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return l != ""
+}
+
+// projectName turns a working directory into a short, recognisable name:
+// a Claude Code worktree (<repo>/.claude/worktrees/<name>) and a Herdr
+// worktree (~/.herdr/worktrees/<repo>/<name>) both become "<repo>/<name>";
+// anything else is its last path component.
+func projectName(cwd string) string {
+	cwd = strings.TrimRight(cwd, "/")
+	if i := strings.Index(cwd, "/.claude/worktrees/"); i >= 0 {
+		return filepath.Base(cwd[:i]) + "/" + cwd[i+len("/.claude/worktrees/"):]
+	}
+	if i := strings.Index(cwd, "/.herdr/worktrees/"); i >= 0 {
+		return cwd[i+len("/.herdr/worktrees/"):]
+	}
+	if cwd == "" {
+		return ""
+	}
+	return filepath.Base(cwd)
 }
 
 func collectStats(panes []paneEntry) []tokenStats {
@@ -892,6 +950,7 @@ func collectStats(panes []paneEntry) []tokenStats {
 		s.Status = p.AgentStatus
 		s.Cwd = p.Cwd
 		s.TabLabel = tabLabels[p.TabID]
+		s.SessTitle = p.Title
 		stats = append(stats, s)
 	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].Cost > stats[j].Cost })

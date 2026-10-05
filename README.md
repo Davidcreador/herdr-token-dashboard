@@ -95,7 +95,7 @@ Pane w2:p1 · msgs:38 · in:222.5k out:21.7k
 
 | Column | Description |
 |--------|-------------|
-| PANE | Compact pane ID |
+| SESSION | The tab label if you named the tab; otherwise the project (from the pane's cwd, worktree-aware) and the session's terminal title, e.g. `my-repo · Fix login flow`. Falls back to the pane ID |
 | AGENT | Agent name (pi / opencode / claude / codex) |
 | STATUS | Current agent status with colored dot |
 | COST | Session cost (green <$5, yellow <$25, red >$25) |
