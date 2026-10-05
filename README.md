@@ -78,6 +78,7 @@ Or use the keybinding: `prefix+$`
 | `↑`/`↓`, `j`/`k`, mouse wheel | Scroll |
 | `PgUp`/`PgDn` (`b`/`f`/`space`) | Scroll a page |
 | `g`/`G` (`Home`/`End`) | Jump to top / end |
+| `h` / `tab` | Toggle the history view (Claude Code) |
 | `r` | Manual refresh |
 | Auto | Refreshes every 3 seconds |
 
@@ -102,9 +103,19 @@ Pane w2:p1 · msgs:38 · in:222.5k out:21.7k
 | AGENT | Agent name (pi / opencode / claude / codex) |
 | STATUS | Current agent status with colored dot |
 | COST | Session cost (green <$5, yellow <$25, red >$25) |
+| TODAY | Claude Code: everything the pane's project directory spent today, across all its sessions and their subagents — so it survives `/clear` |
 | MODEL | Current model in use |
 | MSGS | Total message/turn count |
 | TOOLS | Total tool calls |
+
+### History view (Claude Code)
+
+Press `h` to switch from the live panes to spend per project, read from every transcript under
+`~/.claude/projects` — closed panes, cleared sessions and subagents included: TODAY, YESTERDAY,
+7 DAYS, 30 DAYS, ALL, the subagents' share of the last 7 days, the session count, and a bar per day
+for the last 14 days. The first scan runs in the background (a few seconds for a few GB of
+transcripts); after that each file is read incrementally from where the last scan stopped, every
+30 seconds.
 
 ### Per-Agent Detail Cards
 

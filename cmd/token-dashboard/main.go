@@ -145,6 +145,8 @@ type tokenStats struct {
 	Subagents   int     // Claude Code: subagent transcripts folded into the totals
 	SubCost     float64 // Claude Code: the subagents' share of Cost
 	SessTitle   string  // the pane's terminal title (Claude Code sets it per conversation)
+	ProjToday   float64 // the pane's project directory, today, all sessions (survives /clear)
+	ProjTodayOK bool
 	Started     time.Time
 	LastAct     time.Time
 	Duration    time.Duration
@@ -233,6 +235,8 @@ type model struct {
 	// offset is the first body line shown: the body (table + cards) scrolls
 	// under a fixed header and help line.
 	offset int
+	// history switches the body to the per-project spend history.
+	history bool
 }
 
 func initialModel() model {
@@ -242,6 +246,7 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
+	hist.maybeScan()
 	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
@@ -253,6 +258,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case tickMsg:
+		hist.maybeScan()
 		m.refresh()
 		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return tickMsg{} })
 	case tea.MouseWheelMsg:
@@ -271,7 +277,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
 		case "r":
+			hist.maybeScan()
 			m.refresh()
+		case "h", "tab":
+			m.history = !m.history
+			m.offset = 0
 		case "up", "k":
 			m.offset--
 		case "down", "j":
@@ -443,9 +453,13 @@ func (m model) View() tea.View {
 	}
 
 	// ── Header (fixed) ────────────────────────────────────────────────
+	mode := "live"
+	if m.history {
+		mode = "history"
+	}
 	header := titleStyle.Render(" ◆ Token Dashboard ")
 	sub := subtitleStyle.Render(
-		fmt.Sprintf("  auto-refresh 3s  ·  %s", m.updated.Format("15:04:05")),
+		fmt.Sprintf("  %s  ·  auto-refresh 3s  ·  %s", mode, m.updated.Format("15:04:05")),
 	)
 
 	// ── Body (scrolls) ────────────────────────────────────────────────
@@ -484,7 +498,11 @@ func (m model) View() tea.View {
 
 // helpText is the fixed help line under the scrolling body.
 func (m model) helpText() string {
-	return "  ↑↓/jk scroll  ·  PgUp/PgDn  ·  g/G top/end  ·  r refresh  ·  q/esc close"
+	toggle := "h history"
+	if m.history {
+		toggle = "h live"
+	}
+	return "  ↑↓/jk scroll  ·  PgUp/PgDn  ·  g/G top/end  ·  " + toggle + "  ·  r refresh  ·  q/esc close"
 }
 
 // renderBody renders everything below the header; View scrolls it.
@@ -493,6 +511,8 @@ func (m model) renderBody(width int) string {
 	switch {
 	case m.err != "":
 		b.WriteString(errorStyle.Render("  ⚠ "+m.err) + "\n")
+	case m.history:
+		b.WriteString(renderHistory(width))
 	case len(m.stats) == 0:
 		b.WriteString(labelStyle.Render("  No agent panes detected.") + "\n")
 	default:
@@ -507,6 +527,134 @@ func (m model) renderBody(width int) string {
 	return b.String()
 }
 
+// renderHistory renders per-project Claude Code spend from every transcript on
+// disk (subagents included): today, yesterday, 7 and 30 days, all time.
+func renderHistory(width int) string {
+	var b strings.Builder
+	if !hist.ready() {
+		b.WriteString(labelStyle.Render("  Scanning ~/.claude/projects for the first time… (runs in the background)") + "\n")
+		return b.String()
+	}
+	const days = 14
+	rows, daily := hist.summary(time.Now(), days)
+
+	wName, wNum, wSess := 40, 10, 6
+	if avail := width - 4 - (6*wNum + wSess + 7); avail < wName {
+		wName = avail
+		if wName < 16 {
+			wName = 16
+		}
+	}
+	cols := []string{"TODAY", "YESTERDAY", "7 DAYS", "30 DAYS", "ALL", "SUB 7D"}
+	hdr := []string{padRight("PROJECT", wName)}
+	for _, c := range cols {
+		hdr = append(hdr, padRight(c, wNum))
+	}
+	hdr = append(hdr, padRight("SESS", wSess))
+	b.WriteString("  " + headerStyle.Render(strings.Join(hdr, " ")) + "\n")
+	sepLen := wName + 6*wNum + wSess + 7
+	b.WriteString("  " + separatorStyle.Render(strings.Repeat("─", sepLen)) + "\n")
+
+	money := func(v float64) string {
+		if v < 0.005 {
+			return labelStyle.Render("—")
+		}
+		return costStyle(v).Render(fmt.Sprintf("$%.2f", v))
+	}
+	var tot projRow
+	for _, r := range rows {
+		share := labelStyle.Render("—")
+		if r.D7 > 0 && r.Sub7 > 0 {
+			share = costMid.Render(fmt.Sprintf("%.0f%%", 100*r.Sub7/r.D7))
+		}
+		parts := []string{
+			padRight(trunc(r.Name, wName), wName),
+			padRight(money(r.Today), wNum), padRight(money(r.Yday), wNum),
+			padRight(money(r.D7), wNum), padRight(money(r.D30), wNum),
+			padRight(money(r.All), wNum), padRight(share, wNum),
+			padRight(labelStyle.Render(fmt.Sprintf("%d", r.Sessions)), wSess),
+		}
+		b.WriteString("  " + strings.Join(parts, " ") + "\n")
+		tot.Today += r.Today
+		tot.Yday += r.Yday
+		tot.D7 += r.D7
+		tot.D30 += r.D30
+		tot.All += r.All
+		tot.Sub7 += r.Sub7
+		tot.Sessions += r.Sessions
+	}
+	b.WriteString("  " + totalSeparatorStyle.Render(strings.Repeat("═", sepLen)) + "\n")
+	share := ""
+	if tot.D7 > 0 {
+		share = fmt.Sprintf("%.0f%%", 100*tot.Sub7/tot.D7)
+	}
+	totParts := []string{padRight("TOTAL", wName)}
+	for _, v := range []float64{tot.Today, tot.Yday, tot.D7, tot.D30, tot.All} {
+		totParts = append(totParts, padRight(costTotal.Render(fmt.Sprintf("$%.2f", v)), wNum))
+	}
+	totParts = append(totParts, padRight(share, wNum), padRight(fmt.Sprintf("%d", tot.Sessions), wSess))
+	b.WriteString("  " + totalStyle.Render(strings.Join(totParts, " ")) + "\n\n")
+
+	// Daily totals, newest first, with a bar scaled to the busiest day.
+	b.WriteString("  " + headerStyle.Render(fmt.Sprintf("LAST %d DAYS", days)) + "\n")
+	peak := 0.0
+	for _, v := range daily {
+		if v > peak {
+			peak = v
+		}
+	}
+	barW := width - 30
+	if barW > 50 {
+		barW = 50
+	}
+	now := time.Now()
+	for i, v := range daily {
+		n := 0
+		if peak > 0 && barW > 0 {
+			n = int(v / peak * float64(barW))
+		}
+		b.WriteString(fmt.Sprintf("  %s  %s %s\n",
+			labelStyle.Render(now.AddDate(0, 0, -i).Format("Mon 01-02")),
+			padRight(money(v), wNum),
+			costMid.Render(strings.Repeat("█", n))))
+	}
+	b.WriteString("\n" + labelStyle.Render("  API list-price estimate (cache read 0.1×, write 1.25× / 2× for 1h TTL); a Max plan is not billed this way. Subagents included.") + "\n")
+	return b.String()
+}
+
+// todayCell is the TODAY column: everything the pane's project directory spent
+// today, across all its sessions (so it survives /clear) and their subagents.
+func todayCell(s tokenStats) string {
+	if s.Source != "claude" {
+		return labelStyle.Render("—")
+	}
+	if !s.ProjTodayOK {
+		return labelStyle.Render("…")
+	}
+	return costStyle(s.ProjToday).Render(fmt.Sprintf("$%.2f", s.ProjToday))
+}
+
+// totalToday sums TODAY over distinct project directories: two panes in the
+// same directory share one TODAY figure and must not be counted twice.
+func totalToday(stats []tokenStats) string {
+	seen := map[string]bool{}
+	sum, ok := 0.0, false
+	for _, s := range stats {
+		if s.Source != "claude" || !s.ProjTodayOK {
+			continue
+		}
+		ok = true
+		if d := mungeClaudePath(s.Cwd); !seen[d] {
+			seen[d] = true
+			sum += s.ProjToday
+		}
+	}
+	if !ok {
+		return ""
+	}
+	return costTotal.Render(fmt.Sprintf("$%.2f", sum))
+}
+
 // renderTable renders the summary table with responsive column widths.
 func renderTable(stats []tokenStats, total tokenStats, width int) string {
 	var b strings.Builder
@@ -517,10 +665,11 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 	wAgent := 9
 	wStatus := 9
 	wCost := 9
+	wToday := 9
 	wModel := 14
 	wMsg := 6
 	wTools := 6
-	fixedW := wPane + wAgent + wStatus + wCost + wModel + wMsg + wTools + 6 // 6 spaces between
+	fixedW := wPane + wAgent + wStatus + wCost + wToday + wModel + wMsg + wTools + 7 // 7 spaces between
 	if fixedW > avail && wPane-(fixedW-avail) >= 18 {
 		// The SESSION column gives way first, down to 18 cells.
 		wPane -= fixedW - avail
@@ -530,15 +679,15 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		// Drop model and tools columns if too narrow.
 		wModel = 0
 		wTools = 0
-		fixedW = wPane + wAgent + wStatus + wCost + wMsg + 4
+		fixedW = wPane + wAgent + wStatus + wCost + wToday + wMsg + 5
 		if fixedW > avail {
 			wModel = 0
 			wMsg = 0
-			fixedW = wPane + wAgent + wStatus + wCost + 3
+			fixedW = wPane + wAgent + wStatus + wCost + wToday + 4
 		}
 	}
 
-	sepLen := wPane + wAgent + wStatus + wCost
+	sepLen := wPane + wAgent + wStatus + wCost + wToday + 1
 	if wModel > 0 {
 		sepLen += wModel
 	}
@@ -557,6 +706,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		padRight("AGENT", wAgent),
 		padRight("STATUS", wStatus),
 		padRight("COST", wCost),
+		padRight("TODAY", wToday),
 	}
 	if wModel > 0 {
 		hdrParts = append(hdrParts, padRight("MODEL", wModel))
@@ -592,6 +742,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 			padRight(agentBadge(s.Agent), wAgent),
 			padRight(statusStr, wStatus),
 			padRight(costS.Render(costStr), wCost),
+			padRight(todayCell(s), wToday),
 		}
 		if wModel > 0 {
 			modelStr := fallback(s.Model, "—")
@@ -619,6 +770,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		padRight("", wAgent),
 		padRight("", wStatus),
 		padRight(costTotal.Render(fmt.Sprintf("$%.2f", total.Cost)), wCost),
+		padRight(totalToday(stats), wToday),
 	}
 	if wModel > 0 {
 		totParts = append(totParts, padRight("", wModel))
@@ -1020,6 +1172,9 @@ func collectStats(panes []paneEntry) []tokenStats {
 		s.Cwd = p.Cwd
 		s.TabLabel = tabLabels[p.TabID]
 		s.SessTitle = p.Title
+		if s.Source == "claude" {
+			s.ProjToday, s.ProjTodayOK = hist.todayFor(mungeClaudePath(p.Cwd), time.Now())
+		}
 		stats = append(stats, s)
 	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].Cost > stats[j].Cost })
