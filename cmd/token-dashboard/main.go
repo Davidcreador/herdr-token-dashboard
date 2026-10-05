@@ -141,6 +141,8 @@ type tokenStats struct {
 	Mode        string
 	Messages    int
 	Compactions int
+	Subagents   int     // Claude Code: subagent transcripts folded into the totals
+	SubCost     float64 // Claude Code: the subagents' share of Cost
 	Started     time.Time
 	LastAct     time.Time
 	Duration    time.Duration
@@ -620,6 +622,13 @@ func renderCard(s tokenStats, width int) string {
 		}
 		if s.Compactions > 0 {
 			parts = append(parts, labelStyle.Render("compactions: ")+costMid.Render(fmt.Sprintf("%d", s.Compactions)))
+		}
+		if s.Subagents > 0 {
+			share := ""
+			if s.Cost > 0 {
+				share = fmt.Sprintf(" (%.0f%% of cost)", 100*s.SubCost/s.Cost)
+			}
+			parts = append(parts, labelStyle.Render("subagents: ")+costMid.Render(fmt.Sprintf("%d · $%.2f%s", s.Subagents, s.SubCost, share)))
 		}
 		inner.WriteString("  " + strings.Join(parts, "  ") + "\n")
 	}
@@ -1182,100 +1191,122 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 		debugLog("claude transcript not found for session " + sessionID)
 		return
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
+	// Subagents (Task/Agent tool) write their own transcripts beside the
+	// session, in <session-id>/subagents/agent-*.jsonl. They spend the same
+	// plan, so they are folded into the totals; the session's timing still
+	// comes from the main transcript only.
+	files := []string{path}
+	subs, _ := filepath.Glob(filepath.Join(strings.TrimSuffix(path, ".jsonl"), "subagents", "*.jsonl"))
+	files = append(files, subs...)
 
 	type claudeTurn struct {
 		model                         string
 		input, output, cacheR, cacheW int
+		sub                           bool
 	}
 	turns := map[string]claudeTurn{}
 	seenTools := map[string]bool{}
 	var firstTS, lastTS time.Time
 
-	for _, line := range bytes.Split(data, []byte("\n")) {
-		if len(line) == 0 {
-			continue
-		}
-		var entry struct {
-			Type      string `json:"type"`
-			Timestamp string `json:"timestamp"`
-			RequestID string `json:"requestId"`
-			Message   struct {
-				ID    string `json:"id"`
-				Model string `json:"model"`
-				Usage struct {
-					InputTokens              int `json:"input_tokens"`
-					OutputTokens             int `json:"output_tokens"`
-					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-				} `json:"usage"`
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
-		}
-		if json.Unmarshal(line, &entry) != nil {
-			continue
-		}
-
-		if entry.Timestamp != "" {
-			if ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
-				if firstTS.IsZero() {
-					firstTS = ts
-				}
-				lastTS = ts
+	for fi, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			if fi == 0 {
+				return
 			}
-		}
-
-		if entry.Type != "assistant" || entry.Message.ID == "" {
 			continue
 		}
+		isSub := fi > 0
 
-		if entry.Message.Model != "" {
-			s.Model = entry.Message.Model
-			s.Provider = "anthropic"
-		}
-
-		turns[entry.Message.ID+"\x00"+entry.RequestID] = claudeTurn{
-			model:  entry.Message.Model,
-			input:  entry.Message.Usage.InputTokens,
-			output: entry.Message.Usage.OutputTokens,
-			cacheR: entry.Message.Usage.CacheReadInputTokens,
-			cacheW: entry.Message.Usage.CacheCreationInputTokens,
-		}
-
-		// Tool calls appear as tool_use content blocks. Blocks carry unique
-		// ids, so repeated records for the same message don't double-count.
-		var blocks []struct {
-			Type string `json:"type"`
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		if len(entry.Message.Content) == 0 || json.Unmarshal(entry.Message.Content, &blocks) != nil {
-			continue
-		}
-		for _, blk := range blocks {
-			if blk.Type != "tool_use" || blk.Name == "" {
+		for _, line := range bytes.Split(data, []byte("\n")) {
+			if len(line) == 0 {
 				continue
 			}
-			if blk.ID != "" {
-				if seenTools[blk.ID] {
+			var entry struct {
+				Type      string `json:"type"`
+				Timestamp string `json:"timestamp"`
+				RequestID string `json:"requestId"`
+				Message   struct {
+					ID    string `json:"id"`
+					Model string `json:"model"`
+					Usage struct {
+						InputTokens              int `json:"input_tokens"`
+						OutputTokens             int `json:"output_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+					} `json:"usage"`
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &entry) != nil {
+				continue
+			}
+
+			if entry.Timestamp != "" && !isSub {
+				if ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
+					if firstTS.IsZero() {
+						firstTS = ts
+					}
+					lastTS = ts
+				}
+			}
+
+			if entry.Type != "assistant" || entry.Message.ID == "" {
+				continue
+			}
+
+			if entry.Message.Model != "" {
+				s.Model = entry.Message.Model
+				s.Provider = "anthropic"
+			}
+
+			turns[entry.Message.ID+"\x00"+entry.RequestID] = claudeTurn{
+				model:  entry.Message.Model,
+				input:  entry.Message.Usage.InputTokens,
+				output: entry.Message.Usage.OutputTokens,
+				cacheR: entry.Message.Usage.CacheReadInputTokens,
+				cacheW: entry.Message.Usage.CacheCreationInputTokens,
+				sub:    isSub,
+			}
+
+			// Tool calls appear as tool_use content blocks. Blocks carry unique
+			// ids, so repeated records for the same message don't double-count.
+			var blocks []struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			}
+			if len(entry.Message.Content) == 0 || json.Unmarshal(entry.Message.Content, &blocks) != nil {
+				continue
+			}
+			for _, blk := range blocks {
+				if blk.Type != "tool_use" || blk.Name == "" {
 					continue
 				}
-				seenTools[blk.ID] = true
+				if blk.ID != "" {
+					if seenTools[blk.ID] {
+						continue
+					}
+					seenTools[blk.ID] = true
+				}
+				s.Tools[blk.Name]++
+				s.ToolTotal++
 			}
-			s.Tools[blk.Name]++
-			s.ToolTotal++
 		}
+
 	}
 
+	s.Subagents = len(subs)
 	for _, t := range turns {
 		s.InputT += t.input
 		s.OutputT += t.output
 		s.CacheR += t.cacheR
 		s.CacheW += t.cacheW
-		s.Cost += claudeCost(t.model, t.input, t.output, t.cacheR, t.cacheW)
+		c := claudeCost(t.model, t.input, t.output, t.cacheR, t.cacheW)
+		s.Cost += c
+		if t.sub {
+			s.SubCost += c
+		}
 	}
 	s.Messages = len(turns)
 

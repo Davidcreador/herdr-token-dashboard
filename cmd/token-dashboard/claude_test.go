@@ -266,3 +266,41 @@ func TestMungeClaudePath(t *testing.T) {
 		t.Errorf("mungeClaudePath = %q, want %q", got, "-tmp-a-b-c-d")
 	}
 }
+
+// TestReadClaudeSessionSubagents: subagent transcripts live in
+// <session-id>/subagents/*.jsonl and must be folded into the totals, while
+// the session's start/duration still come from the main transcript only.
+func TestReadClaudeSessionSubagents(t *testing.T) {
+	root := t.TempDir()
+	withClaudeProjectsRoot(t, root)
+	cwd := "/home/user/projects/app"
+	dir := mungeClaudePath(cwd)
+	writeTranscript(t, root, dir, []string{
+		`{"type":"assistant","timestamp":"2026-07-13T10:00:00.000Z","requestId":"req_m","message":{"id":"msg_m","model":"claude-opus-5","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":"hi"}}`,
+	})
+	subDir := filepath.Join(root, dir, testSessionID, "subagents")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sub := `{"type":"assistant","timestamp":"2026-07-14T10:00:00.000Z","requestId":"req_s","message":{"id":"msg_s","model":"claude-opus-5","usage":{"input_tokens":3000,"output_tokens":300,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":"hi"}}`
+	if err := os.WriteFile(filepath.Join(subDir, "agent-a1.jsonl"), []byte(sub+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := tokenStats{Tools: map[string]int{}}
+	readClaudeSession(testSessionID, cwd, &s)
+
+	if s.InputT != 4000 || s.OutputT != 400 || s.Messages != 2 {
+		t.Errorf("totals = in %d out %d msgs %d, want 4000/400/2", s.InputT, s.OutputT, s.Messages)
+	}
+	if s.Subagents != 1 {
+		t.Errorf("Subagents = %d, want 1", s.Subagents)
+	}
+	want := claudeCost("claude-opus-5", 3000, 300, 0, 0)
+	if math.Abs(s.SubCost-want) > 1e-9 || s.SubCost <= 0 || s.SubCost >= s.Cost {
+		t.Errorf("SubCost = %v, want %v (and < Cost %v)", s.SubCost, want, s.Cost)
+	}
+	if s.Duration != 0 {
+		t.Errorf("Duration = %v, want 0 (subagent timestamps must not stretch the session)", s.Duration)
+	}
+}
