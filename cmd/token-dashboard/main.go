@@ -105,6 +105,7 @@ type paneEntry struct {
 	Label        string        `json:"label,omitempty"`
 	TabID        string        `json:"tab_id,omitempty"`
 	Cwd          string        `json:"cwd,omitempty"`
+	Title        string        `json:"terminal_title_stripped,omitempty"`
 	AgentSession *agentSession `json:"agent_session,omitempty"`
 }
 
@@ -141,6 +142,11 @@ type tokenStats struct {
 	Mode        string
 	Messages    int
 	Compactions int
+	Subagents   int     // Claude Code: subagent transcripts folded into the totals
+	SubCost     float64 // Claude Code: the subagents' share of Cost
+	SessTitle   string  // the pane's terminal title (Claude Code sets it per conversation)
+	ProjToday   float64 // the pane's project directory, today, all sessions (survives /clear)
+	ProjTodayOK bool
 	Started     time.Time
 	LastAct     time.Time
 	Duration    time.Duration
@@ -226,6 +232,11 @@ type model struct {
 	// prevStatus tracks the last known status per pane_id so the poll loop
 	// can detect transitions to "done" and fire a Herdr notification.
 	prevStatus map[string]string
+	// offset is the first body line shown: the body (table + cards) scrolls
+	// under a fixed header and help line.
+	offset int
+	// history switches the body to the per-project spend history.
+	history bool
 }
 
 func initialModel() model {
@@ -235,6 +246,7 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
+	hist.maybeScan()
 	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
@@ -246,17 +258,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case tickMsg:
+		hist.maybeScan()
 		m.refresh()
 		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+	case tea.MouseWheelMsg:
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.offset -= 3
+		case tea.MouseWheelDown:
+			m.offset += 3
+		}
 	case tea.KeyPressMsg:
+		page := m.bodyHeight() - 1
+		if page < 1 {
+			page = 1
+		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
 		case "r":
+			hist.maybeScan()
 			m.refresh()
+		case "h", "tab":
+			m.history = !m.history
+			m.offset = 0
+		case "up", "k":
+			m.offset--
+		case "down", "j":
+			m.offset++
+		case "pgup", "b", "ctrl+u":
+			m.offset -= page
+		case "pgdown", "f", "space", "ctrl+d":
+			m.offset += page
+		case "home", "g":
+			m.offset = 0
+		case "end", "G":
+			m.offset = 1 << 30 // clamped in View
 		}
 	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
 	return m, nil
+}
+
+// bodyHeight is the number of screen lines available to the scrolling body:
+// the terminal height minus the header (2 lines) and the help line (2 lines).
+func (m model) bodyHeight() int {
+	h := m.height - 4
+	if h < 3 {
+		h = 3
+	}
+	return h
 }
 
 func (m *model) refresh() {
@@ -381,36 +434,88 @@ func trunc(s string, width int) string {
 	if lipgloss.Width(s) <= width {
 		return s
 	}
-	return s[:width-1] + "…"
+	if width < 1 {
+		return ""
+	}
+	r := []rune(s) // rune-safe: byte slicing split multi-byte characters
+	for len(r) > 0 && lipgloss.Width(string(r))+1 > width {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 // ── View ────────────────────────────────────────────────────────────────────
 
 func (m model) View() tea.View {
-	var b strings.Builder
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
 
-	// ── Header ────────────────────────────────────────────────────────
+	// ── Header (fixed) ────────────────────────────────────────────────
+	mode := "live"
+	if m.history {
+		mode = "history"
+	}
 	header := titleStyle.Render(" ◆ Token Dashboard ")
 	sub := subtitleStyle.Render(
-		fmt.Sprintf("  auto-refresh 3s  ·  %s", m.updated.Format("15:04:05")),
+		fmt.Sprintf("  %s  ·  auto-refresh 3s  ·  %s", mode, m.updated.Format("15:04:05")),
 	)
-	b.WriteString(header + sub + "\n\n")
 
-	if m.err != "" {
-		b.WriteString(errorStyle.Render("  ⚠ "+m.err) + "\n")
-		b.WriteString(helpStyle.Render("  r refresh  ·  q/esc close") + "\n")
-		view := tea.NewView(b.String())
-		view.AltScreen = true
-		return view
+	// ── Body (scrolls) ────────────────────────────────────────────────
+	b := m.renderBody(width)
+	lines := strings.Split(strings.TrimRight(b, "\n"), "\n")
+	bh := m.bodyHeight()
+	maxOff := len(lines) - bh
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	off := m.offset
+	if off > maxOff {
+		off = maxOff
+	}
+	end := off + bh
+	if end > len(lines) {
+		end = len(lines)
+	}
+	body := strings.Join(lines[off:end], "\n")
+	if pad := bh - (end - off); pad > 0 {
+		body += strings.Repeat("\n", pad)
 	}
 
-	if len(m.stats) == 0 {
+	// ── Help (fixed) ──────────────────────────────────────────────────
+	pos := ""
+	if maxOff > 0 {
+		pos = fmt.Sprintf("  ·  lines %d–%d of %d", off+1, end, len(lines))
+	}
+	help := helpStyle.Render(m.helpText() + pos)
+
+	view := tea.NewView(header + sub + "\n\n" + body + "\n" + help) // helpStyle carries its own MarginTop(1)
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	return view
+}
+
+// helpText is the fixed help line under the scrolling body.
+func (m model) helpText() string {
+	toggle := "h history"
+	if m.history {
+		toggle = "h live"
+	}
+	return "  ↑↓/jk scroll  ·  PgUp/PgDn  ·  g/G top/end  ·  " + toggle + "  ·  r refresh  ·  q/esc close"
+}
+
+// renderBody renders everything below the header; View scrolls it.
+func (m model) renderBody(width int) string {
+	var b strings.Builder
+	switch {
+	case m.err != "":
+		b.WriteString(errorStyle.Render("  ⚠ "+m.err) + "\n")
+	case m.history:
+		b.WriteString(renderHistory(width))
+	case len(m.stats) == 0:
 		b.WriteString(labelStyle.Render("  No agent panes detected.") + "\n")
-	} else {
+	default:
 		b.WriteString(renderTable(m.stats, m.total, width))
 		b.WriteString("\n")
 		for _, s := range m.stats {
@@ -419,12 +524,135 @@ func (m model) View() tea.View {
 		}
 		b.WriteString(renderSummary(m.total, len(m.stats), width))
 	}
+	return b.String()
+}
 
-	b.WriteString("\n" + helpStyle.Render("  r refresh  ·  q/esc close  ·  auto-refresh 3s"))
+// renderHistory renders per-project Claude Code spend from every transcript on
+// disk (subagents included): today, yesterday, 7 and 30 days, all time.
+func renderHistory(width int) string {
+	var b strings.Builder
+	if !hist.ready() {
+		b.WriteString(labelStyle.Render("  Scanning ~/.claude/projects for the first time… (runs in the background)") + "\n")
+		return b.String()
+	}
+	const days = 14
+	rows, daily := hist.summary(time.Now(), days)
 
-	view := tea.NewView(b.String())
-	view.AltScreen = true
-	return view
+	wName, wNum, wSess := 40, 10, 6
+	if avail := width - 4 - (6*wNum + wSess + 7); avail < wName {
+		wName = avail
+		if wName < 16 {
+			wName = 16
+		}
+	}
+	cols := []string{"TODAY", "YESTERDAY", "7 DAYS", "30 DAYS", "ALL", "SUB 7D"}
+	hdr := []string{padRight("PROJECT", wName)}
+	for _, c := range cols {
+		hdr = append(hdr, padRight(c, wNum))
+	}
+	hdr = append(hdr, padRight("SESS", wSess))
+	b.WriteString("  " + headerStyle.Render(strings.Join(hdr, " ")) + "\n")
+	sepLen := wName + 6*wNum + wSess + 7
+	b.WriteString("  " + separatorStyle.Render(strings.Repeat("─", sepLen)) + "\n")
+
+	money := func(v float64) string {
+		if v < 0.005 {
+			return labelStyle.Render("—")
+		}
+		return costStyle(v).Render(fmt.Sprintf("$%.2f", v))
+	}
+	var tot projRow
+	for _, r := range rows {
+		share := labelStyle.Render("—")
+		if r.D7 > 0 && r.Sub7 > 0 {
+			share = costMid.Render(fmt.Sprintf("%.0f%%", 100*r.Sub7/r.D7))
+		}
+		parts := []string{
+			padRight(trunc(r.Name, wName), wName),
+			padRight(money(r.Today), wNum), padRight(money(r.Yday), wNum),
+			padRight(money(r.D7), wNum), padRight(money(r.D30), wNum),
+			padRight(money(r.All), wNum), padRight(share, wNum),
+			padRight(labelStyle.Render(fmt.Sprintf("%d", r.Sessions)), wSess),
+		}
+		b.WriteString("  " + strings.Join(parts, " ") + "\n")
+		tot.Today += r.Today
+		tot.Yday += r.Yday
+		tot.D7 += r.D7
+		tot.D30 += r.D30
+		tot.All += r.All
+		tot.Sub7 += r.Sub7
+		tot.Sessions += r.Sessions
+	}
+	b.WriteString("  " + totalSeparatorStyle.Render(strings.Repeat("═", sepLen)) + "\n")
+	share := ""
+	if tot.D7 > 0 {
+		share = fmt.Sprintf("%.0f%%", 100*tot.Sub7/tot.D7)
+	}
+	totParts := []string{padRight("TOTAL", wName)}
+	for _, v := range []float64{tot.Today, tot.Yday, tot.D7, tot.D30, tot.All} {
+		totParts = append(totParts, padRight(costTotal.Render(fmt.Sprintf("$%.2f", v)), wNum))
+	}
+	totParts = append(totParts, padRight(share, wNum), padRight(fmt.Sprintf("%d", tot.Sessions), wSess))
+	b.WriteString("  " + totalStyle.Render(strings.Join(totParts, " ")) + "\n\n")
+
+	// Daily totals, newest first, with a bar scaled to the busiest day.
+	b.WriteString("  " + headerStyle.Render(fmt.Sprintf("LAST %d DAYS", days)) + "\n")
+	peak := 0.0
+	for _, v := range daily {
+		if v > peak {
+			peak = v
+		}
+	}
+	barW := width - 30
+	if barW > 50 {
+		barW = 50
+	}
+	now := time.Now()
+	for i, v := range daily {
+		n := 0
+		if peak > 0 && barW > 0 {
+			n = int(v / peak * float64(barW))
+		}
+		b.WriteString(fmt.Sprintf("  %s  %s %s\n",
+			labelStyle.Render(now.AddDate(0, 0, -i).Format("Mon 01-02")),
+			padRight(money(v), wNum),
+			costMid.Render(strings.Repeat("█", n))))
+	}
+	b.WriteString("\n" + labelStyle.Render("  API list-price estimate (cache read 0.1×, write 1.25× / 2× for 1h TTL); a Max plan is not billed this way. Subagents included.") + "\n")
+	return b.String()
+}
+
+// todayCell is the TODAY column: everything the pane's project directory spent
+// today, across all its sessions (so it survives /clear) and their subagents.
+func todayCell(s tokenStats) string {
+	if s.Source != "claude" {
+		return labelStyle.Render("—")
+	}
+	if !s.ProjTodayOK {
+		return labelStyle.Render("…")
+	}
+	return costStyle(s.ProjToday).Render(fmt.Sprintf("$%.2f", s.ProjToday))
+}
+
+// totalToday sums TODAY over distinct project directories: two panes in the
+// same directory share one TODAY figure and must not be counted twice.
+func totalToday(stats []tokenStats) string {
+	seen := map[string]bool{}
+	sum, ok := 0.0, false
+	for _, s := range stats {
+		if s.Source != "claude" || !s.ProjTodayOK {
+			continue
+		}
+		ok = true
+		if d := mungeClaudePath(s.Cwd); !seen[d] {
+			seen[d] = true
+			sum += s.ProjToday
+		}
+	}
+	if !ok {
+		return ""
+	}
+	return costTotal.Render(fmt.Sprintf("$%.2f", sum))
 }
 
 // renderTable renders the summary table with responsive column widths.
@@ -433,27 +661,33 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 
 	// Column widths — responsive to terminal width.
 	avail := width - 4 // 2 indent + 2 padding
-	wPane := 11
+	wPane := 34
 	wAgent := 9
 	wStatus := 9
 	wCost := 9
+	wToday := 9
 	wModel := 14
 	wMsg := 6
 	wTools := 6
-	fixedW := wPane + wAgent + wStatus + wCost + wModel + wMsg + wTools + 6 // 6 spaces between
+	fixedW := wPane + wAgent + wStatus + wCost + wToday + wModel + wMsg + wTools + 7 // 7 spaces between
+	if fixedW > avail && wPane-(fixedW-avail) >= 18 {
+		// The SESSION column gives way first, down to 18 cells.
+		wPane -= fixedW - avail
+		fixedW = avail
+	}
 	if fixedW > avail {
 		// Drop model and tools columns if too narrow.
 		wModel = 0
 		wTools = 0
-		fixedW = wPane + wAgent + wStatus + wCost + wMsg + 4
+		fixedW = wPane + wAgent + wStatus + wCost + wToday + wMsg + 5
 		if fixedW > avail {
 			wModel = 0
 			wMsg = 0
-			fixedW = wPane + wAgent + wStatus + wCost + 3
+			fixedW = wPane + wAgent + wStatus + wCost + wToday + 4
 		}
 	}
 
-	sepLen := wPane + wAgent + wStatus + wCost
+	sepLen := wPane + wAgent + wStatus + wCost + wToday + 1
 	if wModel > 0 {
 		sepLen += wModel
 	}
@@ -468,10 +702,11 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 
 	// Header row
 	hdrParts := []string{
-		padRight("PANE", wPane),
+		padRight("SESSION", wPane),
 		padRight("AGENT", wAgent),
 		padRight("STATUS", wStatus),
 		padRight("COST", wCost),
+		padRight("TODAY", wToday),
 	}
 	if wModel > 0 {
 		hdrParts = append(hdrParts, padRight("MODEL", wModel))
@@ -503,10 +738,11 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		}
 
 		rowParts := []string{
-			padRight(paneDisplay(s), wPane),
+			padRight(trunc(paneDisplay(s), wPane), wPane),
 			padRight(agentBadge(s.Agent), wAgent),
 			padRight(statusStr, wStatus),
 			padRight(costS.Render(costStr), wCost),
+			padRight(todayCell(s), wToday),
 		}
 		if wModel > 0 {
 			modelStr := fallback(s.Model, "—")
@@ -534,6 +770,7 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		padRight("", wAgent),
 		padRight("", wStatus),
 		padRight(costTotal.Render(fmt.Sprintf("$%.2f", total.Cost)), wCost),
+		padRight(totalToday(stats), wToday),
 	}
 	if wModel > 0 {
 		totParts = append(totParts, padRight("", wModel))
@@ -557,6 +794,9 @@ func renderCard(s tokenStats, width int) string {
 	statusText := fallback(s.Status, "—")
 
 	headerLine := fmt.Sprintf("%s %s %s", badge, dot, statusText)
+	if label := paneDisplay(s); label != "" {
+		headerLine += "  " + valueStyle.Render(label)
+	}
 	if s.Model != "" {
 		headerLine += "  " + modelStyle.Render(s.Model)
 	}
@@ -620,6 +860,13 @@ func renderCard(s tokenStats, width int) string {
 		}
 		if s.Compactions > 0 {
 			parts = append(parts, labelStyle.Render("compactions: ")+costMid.Render(fmt.Sprintf("%d", s.Compactions)))
+		}
+		if s.Subagents > 0 {
+			share := ""
+			if s.Cost > 0 {
+				share = fmt.Sprintf(" (%.0f%% of cost)", 100*s.SubCost/s.Cost)
+			}
+			parts = append(parts, labelStyle.Render("subagents: ")+costMid.Render(fmt.Sprintf("%d · $%.2f%s", s.Subagents, s.SubCost, share)))
 		}
 		inner.WriteString("  " + strings.Join(parts, "  ") + "\n")
 	}
@@ -863,13 +1110,54 @@ func fetchTabLabels() map[string]string {
 	return labels
 }
 
-// paneDisplay is the PANE column value: the tab label when the pane's tab has
-// one, else the short pane id.
+// paneDisplay is the SESSION column value. A tab the user has named keeps its
+// label; Herdr's default tab labels are just numbers ("1", "2", …) and identify
+// nothing, so those panes show the project (from the cwd) and the session's
+// terminal title, which Claude Code sets per conversation.
 func paneDisplay(s tokenStats) string {
-	if s.TabLabel != "" {
+	if s.TabLabel != "" && !isDefaultTabLabel(s.TabLabel) {
+		return s.TabLabel
+	}
+	name := projectName(s.Cwd)
+	switch {
+	case name != "" && s.SessTitle != "":
+		return name + " · " + s.SessTitle
+	case name != "":
+		return name
+	case s.SessTitle != "":
+		return s.SessTitle
+	case s.TabLabel != "":
 		return s.TabLabel
 	}
 	return shortPaneID(s.PaneID)
+}
+
+// isDefaultTabLabel reports whether a tab label is Herdr's numeric default.
+func isDefaultTabLabel(l string) bool {
+	for _, r := range l {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return l != ""
+}
+
+// projectName turns a working directory into a short, recognisable name:
+// a Claude Code worktree (<repo>/.claude/worktrees/<name>) and a Herdr
+// worktree (~/.herdr/worktrees/<repo>/<name>) both become "<repo>/<name>";
+// anything else is its last path component.
+func projectName(cwd string) string {
+	cwd = strings.TrimRight(cwd, "/")
+	if i := strings.Index(cwd, "/.claude/worktrees/"); i >= 0 {
+		return filepath.Base(cwd[:i]) + "/" + cwd[i+len("/.claude/worktrees/"):]
+	}
+	if i := strings.Index(cwd, "/.herdr/worktrees/"); i >= 0 {
+		return cwd[i+len("/.herdr/worktrees/"):]
+	}
+	if cwd == "" {
+		return ""
+	}
+	return filepath.Base(cwd)
 }
 
 func collectStats(panes []paneEntry) []tokenStats {
@@ -883,6 +1171,10 @@ func collectStats(panes []paneEntry) []tokenStats {
 		s.Status = p.AgentStatus
 		s.Cwd = p.Cwd
 		s.TabLabel = tabLabels[p.TabID]
+		s.SessTitle = p.Title
+		if s.Source == "claude" {
+			s.ProjToday, s.ProjTodayOK = hist.todayFor(mungeClaudePath(p.Cwd), time.Now())
+		}
 		stats = append(stats, s)
 	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].Cost > stats[j].Cost })
@@ -1045,7 +1337,8 @@ func readPiSession(path string, s *tokenStats) {
 // USD rates. Prices are ESTIMATES based on public list pricing — update the
 // rates here when Anthropic pricing changes. Matching is by substring,
 // longest match first, so more specific entries (e.g. "sonnet-4-5") win over
-// broader ones ("sonnet-4"). Cache writes are billed at 1.25× input. Cache
+// broader ones ("sonnet-4"). Cache writes are billed at 1.25× input (2× for
+// the 1-hour TTL, see claudeCostTTL). Cache
 // read rates are 0.1× by default, with exceptions in claudeCacheReadMultiplier.
 // Unknown models get no cost estimate (tokens are still shown).
 var claudePricing = []struct {
@@ -1105,11 +1398,23 @@ func blendedCostWithCacheRead(in, out float64, input, output, cacheRead, cacheWr
 
 // claudeCost estimates the USD cost of one assistant turn.
 func claudeCost(model string, input, output, cacheRead, cacheWrite int) float64 {
+	return claudeCostTTL(model, input, output, cacheRead, cacheWrite, 0)
+}
+
+// claudeCostTTL is claudeCost with the 1-hour-TTL share of the cache writes
+// (usage.cache_creation.ephemeral_1h_input_tokens) priced at 2x input instead
+// of 1.25x, per Anthropic's prompt-caching pricing. Claude Code main sessions
+// typically write with the 1h TTL; subagents with the 5m TTL.
+func claudeCostTTL(model string, input, output, cacheRead, cacheWrite, cacheWrite1h int) float64 {
 	in, out, ok := claudeRates(model)
 	if !ok {
 		return 0
 	}
-	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite, claudeCacheReadMultiplier(model))
+	if cacheWrite1h > cacheWrite {
+		cacheWrite1h = cacheWrite
+	}
+	return blendedCostWithCacheRead(in, out, input, output, cacheRead, cacheWrite-cacheWrite1h, claudeCacheReadMultiplier(model)) +
+		float64(cacheWrite1h)*2.0*in/1_000_000
 }
 
 // Anthropic's newest models have model-specific cache-hit prices.
@@ -1182,100 +1487,127 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 		debugLog("claude transcript not found for session " + sessionID)
 		return
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
+	// Subagents (Task/Agent tool) write their own transcripts beside the
+	// session, in <session-id>/subagents/agent-*.jsonl. They spend the same
+	// plan, so they are folded into the totals; the session's timing still
+	// comes from the main transcript only.
+	files := []string{path}
+	subs, _ := filepath.Glob(filepath.Join(strings.TrimSuffix(path, ".jsonl"), "subagents", "*.jsonl"))
+	files = append(files, subs...)
 
 	type claudeTurn struct {
 		model                         string
 		input, output, cacheR, cacheW int
+		cacheW1h                      int
+		sub                           bool
 	}
 	turns := map[string]claudeTurn{}
 	seenTools := map[string]bool{}
 	var firstTS, lastTS time.Time
 
-	for _, line := range bytes.Split(data, []byte("\n")) {
-		if len(line) == 0 {
-			continue
-		}
-		var entry struct {
-			Type      string `json:"type"`
-			Timestamp string `json:"timestamp"`
-			RequestID string `json:"requestId"`
-			Message   struct {
-				ID    string `json:"id"`
-				Model string `json:"model"`
-				Usage struct {
-					InputTokens              int `json:"input_tokens"`
-					OutputTokens             int `json:"output_tokens"`
-					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-				} `json:"usage"`
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
-		}
-		if json.Unmarshal(line, &entry) != nil {
-			continue
-		}
-
-		if entry.Timestamp != "" {
-			if ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
-				if firstTS.IsZero() {
-					firstTS = ts
-				}
-				lastTS = ts
+	for fi, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			if fi == 0 {
+				return
 			}
-		}
-
-		if entry.Type != "assistant" || entry.Message.ID == "" {
 			continue
 		}
+		isSub := fi > 0
 
-		if entry.Message.Model != "" {
-			s.Model = entry.Message.Model
-			s.Provider = "anthropic"
-		}
-
-		turns[entry.Message.ID+"\x00"+entry.RequestID] = claudeTurn{
-			model:  entry.Message.Model,
-			input:  entry.Message.Usage.InputTokens,
-			output: entry.Message.Usage.OutputTokens,
-			cacheR: entry.Message.Usage.CacheReadInputTokens,
-			cacheW: entry.Message.Usage.CacheCreationInputTokens,
-		}
-
-		// Tool calls appear as tool_use content blocks. Blocks carry unique
-		// ids, so repeated records for the same message don't double-count.
-		var blocks []struct {
-			Type string `json:"type"`
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		if len(entry.Message.Content) == 0 || json.Unmarshal(entry.Message.Content, &blocks) != nil {
-			continue
-		}
-		for _, blk := range blocks {
-			if blk.Type != "tool_use" || blk.Name == "" {
+		for _, line := range bytes.Split(data, []byte("\n")) {
+			if len(line) == 0 {
 				continue
 			}
-			if blk.ID != "" {
-				if seenTools[blk.ID] {
+			var entry struct {
+				Type      string `json:"type"`
+				Timestamp string `json:"timestamp"`
+				RequestID string `json:"requestId"`
+				Message   struct {
+					ID    string `json:"id"`
+					Model string `json:"model"`
+					Usage struct {
+						InputTokens              int `json:"input_tokens"`
+						OutputTokens             int `json:"output_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+						CacheCreation            struct {
+							OneHour int `json:"ephemeral_1h_input_tokens"`
+						} `json:"cache_creation"`
+					} `json:"usage"`
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &entry) != nil {
+				continue
+			}
+
+			if entry.Timestamp != "" && !isSub {
+				if ts, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
+					if firstTS.IsZero() {
+						firstTS = ts
+					}
+					lastTS = ts
+				}
+			}
+
+			if entry.Type != "assistant" || entry.Message.ID == "" {
+				continue
+			}
+
+			if entry.Message.Model != "" {
+				s.Model = entry.Message.Model
+				s.Provider = "anthropic"
+			}
+
+			turns[entry.Message.ID+"\x00"+entry.RequestID] = claudeTurn{
+				model:    entry.Message.Model,
+				input:    entry.Message.Usage.InputTokens,
+				output:   entry.Message.Usage.OutputTokens,
+				cacheR:   entry.Message.Usage.CacheReadInputTokens,
+				cacheW:   entry.Message.Usage.CacheCreationInputTokens,
+				sub:      isSub,
+				cacheW1h: entry.Message.Usage.CacheCreation.OneHour,
+			}
+
+			// Tool calls appear as tool_use content blocks. Blocks carry unique
+			// ids, so repeated records for the same message don't double-count.
+			var blocks []struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			}
+			if len(entry.Message.Content) == 0 || json.Unmarshal(entry.Message.Content, &blocks) != nil {
+				continue
+			}
+			for _, blk := range blocks {
+				if blk.Type != "tool_use" || blk.Name == "" {
 					continue
 				}
-				seenTools[blk.ID] = true
+				if blk.ID != "" {
+					if seenTools[blk.ID] {
+						continue
+					}
+					seenTools[blk.ID] = true
+				}
+				s.Tools[blk.Name]++
+				s.ToolTotal++
 			}
-			s.Tools[blk.Name]++
-			s.ToolTotal++
 		}
+
 	}
 
+	s.Subagents = len(subs)
 	for _, t := range turns {
 		s.InputT += t.input
 		s.OutputT += t.output
 		s.CacheR += t.cacheR
 		s.CacheW += t.cacheW
-		s.Cost += claudeCost(t.model, t.input, t.output, t.cacheR, t.cacheW)
+		c := claudeCostTTL(t.model, t.input, t.output, t.cacheR, t.cacheW, t.cacheW1h)
+		s.Cost += c
+		if t.sub {
+			s.SubCost += c
+		}
 	}
 	s.Messages = len(turns)
 

@@ -2,4 +2,7 @@ bin/
 dist/
 .DS_Store
 *.log
-token-dashboard
+# Anchored: a bare `token-dashboard` also matches the cmd/token-dashboard/
+# DIRECTORY, so every new source file there was silently ignored.
+/token-dashboard
+/cmd/token-dashboard/token-dashboard
