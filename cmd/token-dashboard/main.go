@@ -63,6 +63,7 @@ var (
 	ocBadge     = lipgloss.NewStyle().Foreground(green).Bold(true)
 	claudeBadge = lipgloss.NewStyle().Foreground(orange).Bold(true)
 	codexBadge  = lipgloss.NewStyle().Foreground(teal).Bold(true)
+	agyBadge    = lipgloss.NewStyle().Foreground(blue).Bold(true)
 
 	// Cost tiers
 	costLow   = lipgloss.NewStyle().Foreground(green)
@@ -392,6 +393,8 @@ func agentBadge(agent string) string {
 		return claudeBadge.Render("claude")
 	case "codex":
 		return codexBadge.Render("codex")
+	case "agy", "antigravity", "antigravity-cli", "antigravity_cli":
+		return agyBadge.Render("agy")
 	default:
 		return labelStyle.Render(fallback(agent, "—"))
 	}
@@ -1205,8 +1208,14 @@ func extractStats(p paneEntry) tokenStats {
 	case "herdr:codex", "codex":
 		s.Source = "codex"
 		readCodexSession(p.AgentSession.Value, &s)
+	case "herdr:antigravity_cli", "herdr:antigravity-cli", "herdr:agy", "antigravity_cli", "antigravity-cli", "agy":
+		s.Source = "agy"
+		readAgySession(p.AgentSession.Value, &s)
 	default:
-		if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
+		if p.Agent == "agy" || p.Agent == "antigravity" || p.Agent == "antigravity-cli" {
+			s.Source = "agy"
+			readAgySession(p.AgentSession.Value, &s)
+		} else if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
 			s.Source = "pi"
 			readPiSession(p.AgentSession.Value, &s)
 		}
