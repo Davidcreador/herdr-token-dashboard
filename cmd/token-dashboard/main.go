@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -20,7 +18,6 @@ import (
 )
 
 const pluginID = "dave.token-dashboard"
-const opencodeServer = "http://127.0.0.1:4096"
 
 // ── Lip Gloss styles ────────────────────────────────────────────────────────
 
@@ -162,43 +159,6 @@ type tokenStats struct {
 	ToolTotal   int
 	Title       string
 	TabLabel    string
-}
-
-// OpenCode server API response types.
-type ocSessionResponse struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Cost      float64 `json:"cost"`
-	Agent     string  `json:"agent"`
-	Directory string  `json:"directory"`
-	Model     struct {
-		ID         string `json:"id"`
-		ProviderID string `json:"providerID"`
-		Variant    string `json:"variant"`
-	} `json:"model"`
-	Tokens struct {
-		Input     int `json:"input"`
-		Output    int `json:"output"`
-		Reasoning int `json:"reasoning"`
-		Cache     struct {
-			Read  int `json:"read"`
-			Write int `json:"write"`
-		} `json:"cache"`
-	} `json:"tokens"`
-	Time struct {
-		Created int64 `json:"created"`
-		Updated int64 `json:"updated"`
-	} `json:"time"`
-}
-
-type ocMessageListResponse []struct {
-	Info struct {
-		Role string `json:"role"`
-	} `json:"info"`
-	Parts []struct {
-		Type string `json:"type"`
-		Tool string `json:"tool"`
-	} `json:"parts"`
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -1216,6 +1176,9 @@ func collectStats(panes []paneEntry) []tokenStats {
 		s.Cwd = p.Cwd
 		s.TabLabel = tabLabels[p.TabID]
 		s.SessTitle = p.Title
+		if s.SessTitle == "" && s.Title != "" {
+			s.SessTitle = s.Title
+		}
 		if s.Source == "claude" {
 			s.ProjToday, s.ProjTodayOK = hist.todayFor(mungeClaudePath(p.Cwd), time.Now())
 		}
@@ -1245,6 +1208,10 @@ func extractStats(p paneEntry) tokenStats {
 			s.Source = "copilot"
 			sessionID := findCopilotSession(p)
 			readCopilotSession(sessionID, &s)
+		} else if p.Agent == "opencode" {
+			s.Source = "opencode"
+			sessionID := findOpenCodeSession(p)
+			readOpenCodeSession(sessionID, &s)
 		}
 		return s
 	}
@@ -1253,9 +1220,9 @@ func extractStats(p paneEntry) tokenStats {
 	case "herdr:pi":
 		s.Source = "pi"
 		readPiSession(p.AgentSession.Value, &s)
-	case "herdr:opencode":
+	case "herdr:opencode", "opencode":
 		s.Source = "opencode"
-		readOpenCodeLive(p.AgentSession.Value, &s)
+		readOpenCodeSession(p.AgentSession.Value, &s)
 	case "herdr:claude", "claude":
 		s.Source = "claude"
 		readClaudeSession(p.AgentSession.Value, p.Cwd, &s)
@@ -1279,6 +1246,13 @@ func extractStats(p paneEntry) tokenStats {
 				sessionID = findCopilotSession(p)
 			}
 			readCopilotSession(sessionID, &s)
+		} else if p.Agent == "opencode" {
+			s.Source = "opencode"
+			sessionID := p.AgentSession.Value
+			if sessionID == "" {
+				sessionID = findOpenCodeSession(p)
+			}
+			readOpenCodeSession(sessionID, &s)
 		} else if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
 			s.Source = "pi"
 			readPiSession(p.AgentSession.Value, &s)
@@ -1689,184 +1663,6 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 	if !firstTS.IsZero() && !lastTS.IsZero() {
 		s.Duration = lastTS.Sub(firstTS)
 	}
-}
-
-// readOpenCodeLive queries the OpenCode server API for live session data.
-// This gets cost, tokens, model, provider, message count, and tool calls
-// for active sessions that haven't been persisted to disk yet.
-func readOpenCodeLive(sessionID string, s *tokenStats) {
-	// Fetch session summary
-	resp, err := http.Get(opencodeServer + "/session/" + sessionID)
-	if err != nil {
-		// Fallback to disk-based reading for completed sessions.
-		readOpenCodeDisk(sessionID, s)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		readOpenCodeDisk(sessionID, s)
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	var sess ocSessionResponse
-	if json.Unmarshal(body, &sess) != nil {
-		return
-	}
-
-	s.Cost = sess.Cost
-	s.InputT = sess.Tokens.Input
-	s.OutputT = sess.Tokens.Output
-	s.ReasonT = sess.Tokens.Reasoning
-	s.CacheR = sess.Tokens.Cache.Read
-	s.CacheW = sess.Tokens.Cache.Write
-	s.Model = sess.Model.ID
-	s.Provider = sess.Model.ProviderID
-	s.Mode = sess.Agent
-	s.Title = sess.Title
-
-	if sess.Time.Created > 0 {
-		s.Started = time.UnixMilli(sess.Time.Created)
-	}
-	if sess.Time.Updated > 0 {
-		s.LastAct = time.UnixMilli(sess.Time.Updated)
-	}
-	if !s.Started.IsZero() && !s.LastAct.IsZero() {
-		s.Duration = s.LastAct.Sub(s.Started)
-	}
-
-	// Fetch messages for assistant turn count + tool calls.
-	readOpenCodeMessages(sessionID, s)
-}
-
-// readOpenCodeMessages fetches the message list from the OpenCode server API
-// and counts assistant turns and tool calls.
-func readOpenCodeMessages(sessionID string, s *tokenStats) {
-	resp, err := http.Get(opencodeServer + "/session/" + sessionID + "/message")
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	var msgs ocMessageListResponse
-	if json.Unmarshal(body, &msgs) != nil {
-		return
-	}
-
-	for _, m := range msgs {
-		if m.Info.Role == "assistant" {
-			s.Messages++
-		}
-		for _, p := range m.Parts {
-			if p.Type == "tool" && p.Tool != "" {
-				s.Tools[p.Tool]++
-				s.ToolTotal++
-			}
-		}
-	}
-}
-
-// readOpenCodeDisk reads completed OpenCode session data from disk storage.
-// Used as a fallback when the server API is unavailable.
-func readOpenCodeDisk(sessionID string, s *tokenStats) {
-	msgDir := openCodeMessageDir(sessionID)
-	if msgDir == "" {
-		return
-	}
-	entries, err := os.ReadDir(msgDir)
-	if err != nil {
-		return
-	}
-
-	var firstTS, lastTS time.Time
-
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(msgDir, entry.Name()))
-		if err != nil {
-			continue
-		}
-		var msg struct {
-			Role       string  `json:"role"`
-			ModelID    string  `json:"modelID"`
-			ProviderID string  `json:"providerID"`
-			Mode       string  `json:"mode"`
-			Cost       float64 `json:"cost"`
-			Time       struct {
-				Created int64 `json:"created"`
-			} `json:"time"`
-			Tokens struct {
-				Input     int `json:"input"`
-				Output    int `json:"output"`
-				Reasoning int `json:"reasoning"`
-				Cache     struct {
-					Read  int `json:"read"`
-					Write int `json:"write"`
-				} `json:"cache"`
-			} `json:"tokens"`
-		}
-		if json.Unmarshal(data, &msg) != nil {
-			continue
-		}
-
-		s.Cost += msg.Cost
-		s.InputT += msg.Tokens.Input
-		s.OutputT += msg.Tokens.Output
-		s.ReasonT += msg.Tokens.Reasoning
-		s.CacheR += msg.Tokens.Cache.Read
-		s.CacheW += msg.Tokens.Cache.Write
-
-		if msg.ModelID != "" {
-			s.Model = msg.ModelID
-		}
-		if msg.ProviderID != "" {
-			s.Provider = msg.ProviderID
-		}
-		if msg.Mode != "" {
-			s.Mode = msg.Mode
-		}
-		if msg.Role == "assistant" {
-			s.Messages++
-		}
-		if msg.Time.Created > 0 {
-			ts := time.UnixMilli(msg.Time.Created)
-			if firstTS.IsZero() || ts.Before(firstTS) {
-				firstTS = ts
-			}
-			if ts.After(lastTS) {
-				lastTS = ts
-			}
-		}
-	}
-
-	s.Started = firstTS
-	s.LastAct = lastTS
-	if !firstTS.IsZero() && !lastTS.IsZero() {
-		s.Duration = lastTS.Sub(firstTS)
-	}
-}
-
-func openCodeMessageDir(sessionID string) string {
-	h := homeDir()
-	if h == "" {
-		return ""
-	}
-	return filepath.Join(h, ".local", "share", "opencode", "storage", "message", sessionID)
 }
 
 func homeDir() string {
