@@ -64,6 +64,8 @@ var (
 	claudeBadge = lipgloss.NewStyle().Foreground(orange).Bold(true)
 	codexBadge  = lipgloss.NewStyle().Foreground(teal).Bold(true)
 	agyBadge    = lipgloss.NewStyle().Foreground(blue).Bold(true)
+	copilotBadge = lipgloss.NewStyle().Foreground(purple).Bold(true)
+	aicStyle     = lipgloss.NewStyle().Foreground(purple).Bold(true)
 
 	// Cost tiers
 	costLow   = lipgloss.NewStyle().Foreground(green)
@@ -100,14 +102,15 @@ var (
 // ── Data types ──────────────────────────────────────────────────────────────
 
 type paneEntry struct {
-	PaneID       string        `json:"pane_id"`
-	Agent        string        `json:"agent,omitempty"`
-	AgentStatus  string        `json:"agent_status,omitempty"`
-	Label        string        `json:"label,omitempty"`
-	TabID        string        `json:"tab_id,omitempty"`
-	Cwd          string        `json:"cwd,omitempty"`
-	Title        string        `json:"terminal_title_stripped,omitempty"`
-	AgentSession *agentSession `json:"agent_session,omitempty"`
+	PaneID        string        `json:"pane_id"`
+	Agent         string        `json:"agent,omitempty"`
+	AgentStatus   string        `json:"agent_status,omitempty"`
+	Label         string        `json:"label,omitempty"`
+	TabID         string        `json:"tab_id,omitempty"`
+	Cwd           string        `json:"cwd,omitempty"`
+	Title         string        `json:"terminal_title_stripped,omitempty"`
+	TerminalTitle string        `json:"terminal_title,omitempty"`
+	AgentSession  *agentSession `json:"agent_session,omitempty"`
 }
 
 type agentSession struct {
@@ -132,6 +135,10 @@ type tokenStats struct {
 	Status      string
 	Cwd         string
 	Cost        float64
+	AICredits   float64
+	QuotaUsed   int
+	QuotaLimit  int
+	QuotaRemPct float64
 	InputT      int
 	OutputT     int
 	ReasonT     int
@@ -324,6 +331,7 @@ func (m *model) refresh() {
 	m.total = tokenStats{}
 	for _, s := range m.stats {
 		m.total.Cost += s.Cost
+		m.total.AICredits += s.AICredits
 		m.total.InputT += s.InputT
 		m.total.OutputT += s.OutputT
 		m.total.ReasonT += s.ReasonT
@@ -341,8 +349,11 @@ func (m *model) refresh() {
 		// loop (every 3s) catches the transition instead.
 		prev := m.prevStatus[s.PaneID]
 		curr := s.Status
-		if prev != "" && prev != "done" && curr == "done" && s.Cost > 0 {
+		if prev != "" && prev != "done" && curr == "done" && (s.Cost > 0 || s.AICredits > 0) {
 			title := fmt.Sprintf("%s done: $%.2f", fallback(s.Agent, "agent"), s.Cost)
+			if s.AICredits > 0 && s.Cost == 0 {
+				title = fmt.Sprintf("%s done: %.2f AIC", fallback(s.Agent, "agent"), s.AICredits)
+			}
 			body := fmt.Sprintf("Pane %s · msgs:%d · in:%s out:%s",
 				shortPaneID(s.PaneID), s.Messages,
 				fmtTokens(s.InputT), fmtTokens(s.OutputT))
@@ -395,6 +406,8 @@ func agentBadge(agent string) string {
 		return codexBadge.Render("codex")
 	case "agy", "antigravity", "antigravity-cli", "antigravity_cli":
 		return agyBadge.Render("agy")
+	case "copilot", "github-copilot", "github_copilot":
+		return copilotBadge.Render("copilot")
 	default:
 		return labelStyle.Render(fallback(agent, "—"))
 	}
@@ -727,6 +740,9 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		costS := costStyle(s.Cost)
 		if s.Cost > 0 {
 			costStr = fmt.Sprintf("$%.2f", s.Cost)
+		} else if s.AICredits > 0 {
+			costStr = fmt.Sprintf("%.2f AIC", s.AICredits)
+			costS = aicStyle
 		}
 
 		statusStr := statusDot(s.Status) + " " + fallback(s.Status, "—")
@@ -768,11 +784,17 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 	if total.ToolTotal > 0 {
 		totTool = fmt.Sprintf("%d", total.ToolTotal)
 	}
+	totCostStr := fmt.Sprintf("$%.2f", total.Cost)
+	totCostS := costTotal
+	if total.Cost == 0 && total.AICredits > 0 {
+		totCostStr = fmt.Sprintf("%.2f AIC", total.AICredits)
+		totCostS = aicStyle.Copy().Bold(true)
+	}
 	totParts := []string{
 		padRight("TOTAL", wPane),
 		padRight("", wAgent),
 		padRight("", wStatus),
-		padRight(costTotal.Render(fmt.Sprintf("$%.2f", total.Cost)), wCost),
+		padRight(totCostS.Render(totCostStr), wCost),
 		padRight(totalToday(stats), wToday),
 	}
 	if wModel > 0 {
@@ -841,6 +863,17 @@ func renderCard(s tokenStats, width int) string {
 			inner.WriteString(fmt.Sprintf("  %s %s", labelStyle.Render("last:"), valueStyle.Render(s.LastAct.Format("15:04"))))
 		}
 		inner.WriteString("\n")
+	}
+
+	// Cost or AI Credits
+	if s.Cost > 0 {
+		inner.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("cost:"), costStyle(s.Cost).Render(fmt.Sprintf("$%.4f", s.Cost))))
+	} else if s.AICredits > 0 {
+		creditLine := fmt.Sprintf("  %s %s", labelStyle.Render("credits:"), aicStyle.Render(fmt.Sprintf("%.2f AIC", s.AICredits)))
+		if s.QuotaLimit > 0 {
+			creditLine += fmt.Sprintf("  %s %s", labelStyle.Render("quota:"), valueStyle.Render(fmt.Sprintf("%.1f%% rem (%d/%d req)", s.QuotaRemPct, s.QuotaUsed, s.QuotaLimit)))
+		}
+		inner.WriteString(creditLine + "\n")
 	}
 
 	// Token breakdown — only if we have real data
@@ -933,6 +966,9 @@ func renderSummary(total tokenStats, paneCount int, width int) string {
 		labelStyle.Render("panes: ") + valueStyle.Render(fmt.Sprintf("%d", paneCount)),
 		labelStyle.Render("cost: ") + costTotal.Render(fmt.Sprintf("$%.2f", total.Cost)),
 	}
+	if total.AICredits > 0 {
+		parts = append(parts, labelStyle.Render("credits: ")+aicStyle.Render(fmt.Sprintf("%.2f AIC", total.AICredits)))
+	}
 	if total.InputT > 0 {
 		parts = append(parts, labelStyle.Render("in: ")+valueStyle.Render(fmtTokens(total.InputT)))
 	}
@@ -1010,12 +1046,17 @@ func runNotify() {
 
 	for _, p := range panes {
 		debugLog(fmt.Sprintf("checking pane %s vs event pane %s", p.PaneID, ev.PaneID))
-		if p.PaneID == ev.PaneID && p.AgentSession != nil {
+		if p.PaneID == ev.PaneID && (p.AgentSession != nil || p.Agent == "copilot" || strings.Contains(strings.ToLower(p.Agent), "copilot")) {
 			debugLog("matched pane, extracting stats...")
 			stats := extractStats(p)
-			debugLog(fmt.Sprintf("cost=%.2f msgs=%d", stats.Cost, stats.Messages))
-			if stats.Cost > 0 {
-				title := fmt.Sprintf("%s done: $%.2f", fallback(stats.Agent, "agent"), stats.Cost)
+			debugLog(fmt.Sprintf("cost=%.2f aic=%.2f msgs=%d", stats.Cost, stats.AICredits, stats.Messages))
+			if stats.Cost > 0 || stats.AICredits > 0 {
+				var title string
+				if stats.Cost > 0 {
+					title = fmt.Sprintf("%s done: $%.2f", fallback(stats.Agent, "agent"), stats.Cost)
+				} else {
+					title = fmt.Sprintf("%s done: %.2f AIC", fallback(stats.Agent, "agent"), stats.AICredits)
+				}
 				body := fmt.Sprintf("Pane %s · msgs:%d · in:%s out:%s",
 					shortPaneID(stats.PaneID), stats.Messages,
 					fmtTokens(stats.InputT), fmtTokens(stats.OutputT))
@@ -1167,7 +1208,7 @@ func collectStats(panes []paneEntry) []tokenStats {
 	var stats []tokenStats
 	tabLabels := fetchTabLabels()
 	for _, p := range panes {
-		if p.AgentSession == nil {
+		if p.AgentSession == nil && p.Agent != "copilot" && !strings.Contains(strings.ToLower(p.Agent), "copilot") {
 			continue
 		}
 		s := extractStats(p)
@@ -1180,7 +1221,15 @@ func collectStats(panes []paneEntry) []tokenStats {
 		}
 		stats = append(stats, s)
 	}
-	sort.Slice(stats, func(i, j int) bool { return stats[i].Cost > stats[j].Cost })
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].Cost != stats[j].Cost {
+			return stats[i].Cost > stats[j].Cost
+		}
+		if stats[i].AICredits != stats[j].AICredits {
+			return stats[i].AICredits > stats[j].AICredits
+		}
+		return stats[i].Messages > stats[j].Messages
+	})
 	return stats
 }
 
@@ -1192,6 +1241,11 @@ func extractStats(p paneEntry) tokenStats {
 	}
 
 	if p.AgentSession == nil {
+		if p.Agent == "copilot" || strings.Contains(strings.ToLower(p.Agent), "copilot") {
+			s.Source = "copilot"
+			sessionID := findCopilotSession(p)
+			readCopilotSession(sessionID, &s)
+		}
 		return s
 	}
 
@@ -1211,10 +1265,20 @@ func extractStats(p paneEntry) tokenStats {
 	case "herdr:antigravity_cli", "herdr:antigravity-cli", "herdr:agy", "antigravity_cli", "antigravity-cli", "agy":
 		s.Source = "agy"
 		readAgySession(p.AgentSession.Value, &s)
+	case "herdr:copilot", "copilot":
+		s.Source = "copilot"
+		readCopilotSession(p.AgentSession.Value, &s)
 	default:
 		if p.Agent == "agy" || p.Agent == "antigravity" || p.Agent == "antigravity-cli" {
 			s.Source = "agy"
 			readAgySession(p.AgentSession.Value, &s)
+		} else if p.Agent == "copilot" || strings.Contains(strings.ToLower(p.Agent), "copilot") {
+			s.Source = "copilot"
+			sessionID := p.AgentSession.Value
+			if sessionID == "" {
+				sessionID = findCopilotSession(p)
+			}
+			readCopilotSession(sessionID, &s)
 		} else if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
 			s.Source = "pi"
 			readPiSession(p.AgentSession.Value, &s)
