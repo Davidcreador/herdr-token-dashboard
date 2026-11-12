@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -20,7 +18,6 @@ import (
 )
 
 const pluginID = "dave.token-dashboard"
-const opencodeServer = "http://127.0.0.1:4096"
 
 // ── Lip Gloss styles ────────────────────────────────────────────────────────
 
@@ -63,6 +60,9 @@ var (
 	ocBadge     = lipgloss.NewStyle().Foreground(green).Bold(true)
 	claudeBadge = lipgloss.NewStyle().Foreground(orange).Bold(true)
 	codexBadge  = lipgloss.NewStyle().Foreground(teal).Bold(true)
+	agyBadge    = lipgloss.NewStyle().Foreground(blue).Bold(true)
+	copilotBadge = lipgloss.NewStyle().Foreground(purple).Bold(true)
+	aicStyle     = lipgloss.NewStyle().Foreground(purple).Bold(true)
 
 	// Cost tiers
 	costLow   = lipgloss.NewStyle().Foreground(green)
@@ -99,14 +99,15 @@ var (
 // ── Data types ──────────────────────────────────────────────────────────────
 
 type paneEntry struct {
-	PaneID       string        `json:"pane_id"`
-	Agent        string        `json:"agent,omitempty"`
-	AgentStatus  string        `json:"agent_status,omitempty"`
-	Label        string        `json:"label,omitempty"`
-	TabID        string        `json:"tab_id,omitempty"`
-	Cwd          string        `json:"cwd,omitempty"`
-	Title        string        `json:"terminal_title_stripped,omitempty"`
-	AgentSession *agentSession `json:"agent_session,omitempty"`
+	PaneID        string        `json:"pane_id"`
+	Agent         string        `json:"agent,omitempty"`
+	AgentStatus   string        `json:"agent_status,omitempty"`
+	Label         string        `json:"label,omitempty"`
+	TabID         string        `json:"tab_id,omitempty"`
+	Cwd           string        `json:"cwd,omitempty"`
+	Title         string        `json:"terminal_title_stripped,omitempty"`
+	TerminalTitle string        `json:"terminal_title,omitempty"`
+	AgentSession  *agentSession `json:"agent_session,omitempty"`
 }
 
 type agentSession struct {
@@ -131,6 +132,10 @@ type tokenStats struct {
 	Status      string
 	Cwd         string
 	Cost        float64
+	AICredits   float64
+	QuotaUsed   int
+	QuotaLimit  int
+	QuotaRemPct float64
 	InputT      int
 	OutputT     int
 	ReasonT     int
@@ -154,43 +159,6 @@ type tokenStats struct {
 	ToolTotal   int
 	Title       string
 	TabLabel    string
-}
-
-// OpenCode server API response types.
-type ocSessionResponse struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Cost      float64 `json:"cost"`
-	Agent     string  `json:"agent"`
-	Directory string  `json:"directory"`
-	Model     struct {
-		ID         string `json:"id"`
-		ProviderID string `json:"providerID"`
-		Variant    string `json:"variant"`
-	} `json:"model"`
-	Tokens struct {
-		Input     int `json:"input"`
-		Output    int `json:"output"`
-		Reasoning int `json:"reasoning"`
-		Cache     struct {
-			Read  int `json:"read"`
-			Write int `json:"write"`
-		} `json:"cache"`
-	} `json:"tokens"`
-	Time struct {
-		Created int64 `json:"created"`
-		Updated int64 `json:"updated"`
-	} `json:"time"`
-}
-
-type ocMessageListResponse []struct {
-	Info struct {
-		Role string `json:"role"`
-	} `json:"info"`
-	Parts []struct {
-		Type string `json:"type"`
-		Tool string `json:"tool"`
-	} `json:"parts"`
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -323,6 +291,7 @@ func (m *model) refresh() {
 	m.total = tokenStats{}
 	for _, s := range m.stats {
 		m.total.Cost += s.Cost
+		m.total.AICredits += s.AICredits
 		m.total.InputT += s.InputT
 		m.total.OutputT += s.OutputT
 		m.total.ReasonT += s.ReasonT
@@ -340,8 +309,11 @@ func (m *model) refresh() {
 		// loop (every 3s) catches the transition instead.
 		prev := m.prevStatus[s.PaneID]
 		curr := s.Status
-		if prev != "" && prev != "done" && curr == "done" && s.Cost > 0 {
+		if prev != "" && prev != "done" && curr == "done" && (s.Cost > 0 || s.AICredits > 0) {
 			title := fmt.Sprintf("%s done: $%.2f", fallback(s.Agent, "agent"), s.Cost)
+			if s.AICredits > 0 && s.Cost == 0 {
+				title = fmt.Sprintf("%s done: %.2f AIC", fallback(s.Agent, "agent"), s.AICredits)
+			}
 			body := fmt.Sprintf("Pane %s · msgs:%d · in:%s out:%s",
 				shortPaneID(s.PaneID), s.Messages,
 				fmtTokens(s.InputT), fmtTokens(s.OutputT))
@@ -392,6 +364,10 @@ func agentBadge(agent string) string {
 		return claudeBadge.Render("claude")
 	case "codex":
 		return codexBadge.Render("codex")
+	case "agy", "antigravity", "antigravity-cli", "antigravity_cli":
+		return agyBadge.Render("agy")
+	case "copilot", "github-copilot", "github_copilot":
+		return copilotBadge.Render("copilot")
 	default:
 		return labelStyle.Render(fallback(agent, "—"))
 	}
@@ -724,6 +700,9 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 		costS := costStyle(s.Cost)
 		if s.Cost > 0 {
 			costStr = fmt.Sprintf("$%.2f", s.Cost)
+		} else if s.AICredits > 0 {
+			costStr = fmt.Sprintf("%.2f AIC", s.AICredits)
+			costS = aicStyle
 		}
 
 		statusStr := statusDot(s.Status) + " " + fallback(s.Status, "—")
@@ -765,11 +744,17 @@ func renderTable(stats []tokenStats, total tokenStats, width int) string {
 	if total.ToolTotal > 0 {
 		totTool = fmt.Sprintf("%d", total.ToolTotal)
 	}
+	totCostStr := fmt.Sprintf("$%.2f", total.Cost)
+	totCostS := costTotal
+	if total.Cost == 0 && total.AICredits > 0 {
+		totCostStr = fmt.Sprintf("%.2f AIC", total.AICredits)
+		totCostS = aicStyle.Copy().Bold(true)
+	}
 	totParts := []string{
 		padRight("TOTAL", wPane),
 		padRight("", wAgent),
 		padRight("", wStatus),
-		padRight(costTotal.Render(fmt.Sprintf("$%.2f", total.Cost)), wCost),
+		padRight(totCostS.Render(totCostStr), wCost),
 		padRight(totalToday(stats), wToday),
 	}
 	if wModel > 0 {
@@ -838,6 +823,17 @@ func renderCard(s tokenStats, width int) string {
 			inner.WriteString(fmt.Sprintf("  %s %s", labelStyle.Render("last:"), valueStyle.Render(s.LastAct.Format("15:04"))))
 		}
 		inner.WriteString("\n")
+	}
+
+	// Cost or AI Credits
+	if s.Cost > 0 {
+		inner.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("cost:"), costStyle(s.Cost).Render(fmt.Sprintf("$%.4f", s.Cost))))
+	} else if s.AICredits > 0 {
+		creditLine := fmt.Sprintf("  %s %s", labelStyle.Render("credits:"), aicStyle.Render(fmt.Sprintf("%.2f AIC", s.AICredits)))
+		if s.QuotaLimit > 0 {
+			creditLine += fmt.Sprintf("  %s %s", labelStyle.Render("quota:"), valueStyle.Render(fmt.Sprintf("%.1f%% rem (%d/%d req)", s.QuotaRemPct, s.QuotaUsed, s.QuotaLimit)))
+		}
+		inner.WriteString(creditLine + "\n")
 	}
 
 	// Token breakdown — only if we have real data
@@ -930,6 +926,9 @@ func renderSummary(total tokenStats, paneCount int, width int) string {
 		labelStyle.Render("panes: ") + valueStyle.Render(fmt.Sprintf("%d", paneCount)),
 		labelStyle.Render("cost: ") + costTotal.Render(fmt.Sprintf("$%.2f", total.Cost)),
 	}
+	if total.AICredits > 0 {
+		parts = append(parts, labelStyle.Render("credits: ")+aicStyle.Render(fmt.Sprintf("%.2f AIC", total.AICredits)))
+	}
 	if total.InputT > 0 {
 		parts = append(parts, labelStyle.Render("in: ")+valueStyle.Render(fmtTokens(total.InputT)))
 	}
@@ -1007,12 +1006,17 @@ func runNotify() {
 
 	for _, p := range panes {
 		debugLog(fmt.Sprintf("checking pane %s vs event pane %s", p.PaneID, ev.PaneID))
-		if p.PaneID == ev.PaneID && p.AgentSession != nil {
+		if p.PaneID == ev.PaneID && (p.AgentSession != nil || p.Agent == "copilot" || strings.Contains(strings.ToLower(p.Agent), "copilot")) {
 			debugLog("matched pane, extracting stats...")
 			stats := extractStats(p)
-			debugLog(fmt.Sprintf("cost=%.2f msgs=%d", stats.Cost, stats.Messages))
-			if stats.Cost > 0 {
-				title := fmt.Sprintf("%s done: $%.2f", fallback(stats.Agent, "agent"), stats.Cost)
+			debugLog(fmt.Sprintf("cost=%.2f aic=%.2f msgs=%d", stats.Cost, stats.AICredits, stats.Messages))
+			if stats.Cost > 0 || stats.AICredits > 0 {
+				var title string
+				if stats.Cost > 0 {
+					title = fmt.Sprintf("%s done: $%.2f", fallback(stats.Agent, "agent"), stats.Cost)
+				} else {
+					title = fmt.Sprintf("%s done: %.2f AIC", fallback(stats.Agent, "agent"), stats.AICredits)
+				}
 				body := fmt.Sprintf("Pane %s · msgs:%d · in:%s out:%s",
 					shortPaneID(stats.PaneID), stats.Messages,
 					fmtTokens(stats.InputT), fmtTokens(stats.OutputT))
@@ -1164,7 +1168,7 @@ func collectStats(panes []paneEntry) []tokenStats {
 	var stats []tokenStats
 	tabLabels := fetchTabLabels()
 	for _, p := range panes {
-		if p.AgentSession == nil {
+		if p.AgentSession == nil && p.Agent != "copilot" && !strings.Contains(strings.ToLower(p.Agent), "copilot") {
 			continue
 		}
 		s := extractStats(p)
@@ -1172,12 +1176,23 @@ func collectStats(panes []paneEntry) []tokenStats {
 		s.Cwd = p.Cwd
 		s.TabLabel = tabLabels[p.TabID]
 		s.SessTitle = p.Title
+		if s.SessTitle == "" && s.Title != "" {
+			s.SessTitle = s.Title
+		}
 		if s.Source == "claude" {
 			s.ProjToday, s.ProjTodayOK = hist.todayFor(mungeClaudePath(p.Cwd), time.Now())
 		}
 		stats = append(stats, s)
 	}
-	sort.Slice(stats, func(i, j int) bool { return stats[i].Cost > stats[j].Cost })
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].Cost != stats[j].Cost {
+			return stats[i].Cost > stats[j].Cost
+		}
+		if stats[i].AICredits != stats[j].AICredits {
+			return stats[i].AICredits > stats[j].AICredits
+		}
+		return stats[i].Messages > stats[j].Messages
+	})
 	return stats
 }
 
@@ -1189,6 +1204,15 @@ func extractStats(p paneEntry) tokenStats {
 	}
 
 	if p.AgentSession == nil {
+		if p.Agent == "copilot" || strings.Contains(strings.ToLower(p.Agent), "copilot") {
+			s.Source = "copilot"
+			sessionID := findCopilotSession(p)
+			readCopilotSession(sessionID, &s)
+		} else if p.Agent == "opencode" {
+			s.Source = "opencode"
+			sessionID := findOpenCodeSession(p)
+			readOpenCodeSession(sessionID, &s)
+		}
 		return s
 	}
 
@@ -1196,17 +1220,40 @@ func extractStats(p paneEntry) tokenStats {
 	case "herdr:pi":
 		s.Source = "pi"
 		readPiSession(p.AgentSession.Value, &s)
-	case "herdr:opencode":
+	case "herdr:opencode", "opencode":
 		s.Source = "opencode"
-		readOpenCodeLive(p.AgentSession.Value, &s)
+		readOpenCodeSession(p.AgentSession.Value, &s)
 	case "herdr:claude", "claude":
 		s.Source = "claude"
 		readClaudeSession(p.AgentSession.Value, p.Cwd, &s)
 	case "herdr:codex", "codex":
 		s.Source = "codex"
 		readCodexSession(p.AgentSession.Value, &s)
+	case "herdr:antigravity_cli", "herdr:antigravity-cli", "herdr:agy", "antigravity_cli", "antigravity-cli", "agy":
+		s.Source = "agy"
+		readAgySession(p.AgentSession.Value, &s)
+	case "herdr:copilot", "copilot":
+		s.Source = "copilot"
+		readCopilotSession(p.AgentSession.Value, &s)
 	default:
-		if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
+		if p.Agent == "agy" || p.Agent == "antigravity" || p.Agent == "antigravity-cli" {
+			s.Source = "agy"
+			readAgySession(p.AgentSession.Value, &s)
+		} else if p.Agent == "copilot" || strings.Contains(strings.ToLower(p.Agent), "copilot") {
+			s.Source = "copilot"
+			sessionID := p.AgentSession.Value
+			if sessionID == "" {
+				sessionID = findCopilotSession(p)
+			}
+			readCopilotSession(sessionID, &s)
+		} else if p.Agent == "opencode" {
+			s.Source = "opencode"
+			sessionID := p.AgentSession.Value
+			if sessionID == "" {
+				sessionID = findOpenCodeSession(p)
+			}
+			readOpenCodeSession(sessionID, &s)
+		} else if strings.HasSuffix(p.AgentSession.Value, ".jsonl") {
 			s.Source = "pi"
 			readPiSession(p.AgentSession.Value, &s)
 		}
@@ -1616,184 +1663,6 @@ func readClaudeSession(sessionID, cwd string, s *tokenStats) {
 	if !firstTS.IsZero() && !lastTS.IsZero() {
 		s.Duration = lastTS.Sub(firstTS)
 	}
-}
-
-// readOpenCodeLive queries the OpenCode server API for live session data.
-// This gets cost, tokens, model, provider, message count, and tool calls
-// for active sessions that haven't been persisted to disk yet.
-func readOpenCodeLive(sessionID string, s *tokenStats) {
-	// Fetch session summary
-	resp, err := http.Get(opencodeServer + "/session/" + sessionID)
-	if err != nil {
-		// Fallback to disk-based reading for completed sessions.
-		readOpenCodeDisk(sessionID, s)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		readOpenCodeDisk(sessionID, s)
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	var sess ocSessionResponse
-	if json.Unmarshal(body, &sess) != nil {
-		return
-	}
-
-	s.Cost = sess.Cost
-	s.InputT = sess.Tokens.Input
-	s.OutputT = sess.Tokens.Output
-	s.ReasonT = sess.Tokens.Reasoning
-	s.CacheR = sess.Tokens.Cache.Read
-	s.CacheW = sess.Tokens.Cache.Write
-	s.Model = sess.Model.ID
-	s.Provider = sess.Model.ProviderID
-	s.Mode = sess.Agent
-	s.Title = sess.Title
-
-	if sess.Time.Created > 0 {
-		s.Started = time.UnixMilli(sess.Time.Created)
-	}
-	if sess.Time.Updated > 0 {
-		s.LastAct = time.UnixMilli(sess.Time.Updated)
-	}
-	if !s.Started.IsZero() && !s.LastAct.IsZero() {
-		s.Duration = s.LastAct.Sub(s.Started)
-	}
-
-	// Fetch messages for assistant turn count + tool calls.
-	readOpenCodeMessages(sessionID, s)
-}
-
-// readOpenCodeMessages fetches the message list from the OpenCode server API
-// and counts assistant turns and tool calls.
-func readOpenCodeMessages(sessionID string, s *tokenStats) {
-	resp, err := http.Get(opencodeServer + "/session/" + sessionID + "/message")
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	var msgs ocMessageListResponse
-	if json.Unmarshal(body, &msgs) != nil {
-		return
-	}
-
-	for _, m := range msgs {
-		if m.Info.Role == "assistant" {
-			s.Messages++
-		}
-		for _, p := range m.Parts {
-			if p.Type == "tool" && p.Tool != "" {
-				s.Tools[p.Tool]++
-				s.ToolTotal++
-			}
-		}
-	}
-}
-
-// readOpenCodeDisk reads completed OpenCode session data from disk storage.
-// Used as a fallback when the server API is unavailable.
-func readOpenCodeDisk(sessionID string, s *tokenStats) {
-	msgDir := openCodeMessageDir(sessionID)
-	if msgDir == "" {
-		return
-	}
-	entries, err := os.ReadDir(msgDir)
-	if err != nil {
-		return
-	}
-
-	var firstTS, lastTS time.Time
-
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(msgDir, entry.Name()))
-		if err != nil {
-			continue
-		}
-		var msg struct {
-			Role       string  `json:"role"`
-			ModelID    string  `json:"modelID"`
-			ProviderID string  `json:"providerID"`
-			Mode       string  `json:"mode"`
-			Cost       float64 `json:"cost"`
-			Time       struct {
-				Created int64 `json:"created"`
-			} `json:"time"`
-			Tokens struct {
-				Input     int `json:"input"`
-				Output    int `json:"output"`
-				Reasoning int `json:"reasoning"`
-				Cache     struct {
-					Read  int `json:"read"`
-					Write int `json:"write"`
-				} `json:"cache"`
-			} `json:"tokens"`
-		}
-		if json.Unmarshal(data, &msg) != nil {
-			continue
-		}
-
-		s.Cost += msg.Cost
-		s.InputT += msg.Tokens.Input
-		s.OutputT += msg.Tokens.Output
-		s.ReasonT += msg.Tokens.Reasoning
-		s.CacheR += msg.Tokens.Cache.Read
-		s.CacheW += msg.Tokens.Cache.Write
-
-		if msg.ModelID != "" {
-			s.Model = msg.ModelID
-		}
-		if msg.ProviderID != "" {
-			s.Provider = msg.ProviderID
-		}
-		if msg.Mode != "" {
-			s.Mode = msg.Mode
-		}
-		if msg.Role == "assistant" {
-			s.Messages++
-		}
-		if msg.Time.Created > 0 {
-			ts := time.UnixMilli(msg.Time.Created)
-			if firstTS.IsZero() || ts.Before(firstTS) {
-				firstTS = ts
-			}
-			if ts.After(lastTS) {
-				lastTS = ts
-			}
-		}
-	}
-
-	s.Started = firstTS
-	s.LastAct = lastTS
-	if !firstTS.IsZero() && !lastTS.IsZero() {
-		s.Duration = lastTS.Sub(firstTS)
-	}
-}
-
-func openCodeMessageDir(sessionID string) string {
-	h := homeDir()
-	if h == "" {
-		return ""
-	}
-	return filepath.Join(h, ".local", "share", "opencode", "storage", "message", sessionID)
 }
 
 func homeDir() string {

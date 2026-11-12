@@ -9,7 +9,7 @@ A [Herdr](https://herdr.dev) plugin that shows **live token spend** across all y
 - **Live dashboard** — Bubble Tea TUI with Lip Gloss styling, auto-refreshing every 3 seconds
 - **Per-agent breakdown** — cost, tokens (input/output/reasoning/cache), model, provider, session duration, message count, tool call stats
 - **Cost notifications** — Herdr native toast when an agent transitions to `done`, with cost and token summary
-- **Multi-agent support** — tracks [Pi](https://github.com/nicepkg/pi), [OpenCode](https://opencode.ai), [Claude Code](https://claude.com/claude-code), and [Codex](https://github.com/openai/codex) agent sessions
+- **Multi-agent support** — tracks [Pi](https://github.com/nicepkg/pi), [OpenCode](https://opencode.ai), [Claude Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), [Antigravity CLI (AGY)](https://antigravity.google), and [GitHub Copilot CLI](https://github.com/features/copilot) agent sessions
 - **Keybinding** — `prefix+$` opens the dashboard instantly
 
 ## Data Sources
@@ -21,6 +21,8 @@ A [Herdr](https://herdr.dev) plugin that shows **live token spend** across all y
 | OpenCode (completed) | Disk fallback `~/.local/share/opencode/storage/message/{id}/` | Same data from persisted message files |
 | Claude Code | Session transcript `~/.claude/projects/{project}/{session-id}.jsonl` | Full token breakdown (input/output/cache read/cache write), estimated cost, model, message count, tool calls, session duration |
 | Codex | Rollout `~/.codex/sessions/YYYY/MM/DD/rollout-*-{session-id}.jsonl` | Full token breakdown, estimated cost, model, message count, tool calls, session duration |
+| AGY (Antigravity CLI) | Session transcript `~/.gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript.jsonl` | Full token breakdown (input/output/cache read), estimated cost, model, message count, tool calls, session duration |
+| GitHub Copilot CLI | Events stream `~/.copilot/session-state/{id}/events.jsonl` | AI Credits (`AIC`), monthly quota snapshot, token breakdown (input/output/cache read/cache write/reasoning), model, message count, tool calls, session duration |
 
 ### Claude Code
 
@@ -42,6 +44,31 @@ Two Codex-specific details:
 Cost is estimated from a second table of OpenAI list rates for supported Codex models, including the GPT-6 family. Rates use standard tier, short-context prices. Cache reads use the model-specific published multiplier where it differs (GPT-6.1 Sol: 0.05x); cache writes use 1.25x. Older families are deliberately omitted: `gpt-4.1` caches at 0.25x and `gpt-4o` at 0.5x, so costing them with the shared estimate would be wrong, and no rate is better than a wrong one.
 
 > **Note:** estimates use short-context rates. Long-context rates can be higher for requests that exceed a model's context threshold.
+
+### Antigravity CLI (AGY)
+
+AGY panes are matched by their Herdr `agent_session` (source `herdr:antigravity_cli`) and read from the session transcript JSONL that Antigravity CLI writes under `~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript.jsonl`.
+
+Per-turn tokens (input, output, and cached prompt tokens) and tool calls are summed across all planner responses in the transcript. Model selection is inferred from in-session changes or loaded from `~/.gemini/antigravity-cli/settings.json`. Costs are estimated using official Google Gemini list rates (including 90% discount on cached tokens).
+
+### GitHub Copilot CLI
+
+GitHub Copilot CLI panes are tracked automatically via local session logs under `~/.copilot/session-state/<session-id>/`. If Herdr hasn't assigned an `agent_session`, the dashboard resolves the session using robust heuristics:
+1. Matching the pane's terminal title against `workspace.yaml` (e.g. `<Title> - GitHub Copilot`),
+2. Matching active process lockfiles (`inuse.<PID>.lock`), or
+3. Falling back to the most recently active session matching the pane's working directory (`cwd`).
+
+#### AI Credits (`AIC`) and Quota Tracking
+Copilot CLI is billed via **AI Credits** rather than per-token dollar billing. The dashboard reads the exact AI Credits consumed from turn-level usage records (`totalNanoAiu / 1e9`) and displays it in the `COST` column (highlighted in purple, e.g. `2.97 AIC`) and summary footer. It also extracts monthly quota snapshots (`usedRequests / entitlementRequests`, e.g. `quota: 97.6% rem (36/1500 req)`).
+
+#### Token Breakdown
+In addition to AI Credits, the detail card renders the full token breakdown:
+- Input tokens (`in`)
+- Output tokens (`out`)
+- Reasoning tokens (`reason`)
+- Cache read tokens (`cache_r`)
+- Cache write tokens (`cache_w`)
+- Tool call breakdown and message counts
 
 ## Install
 
